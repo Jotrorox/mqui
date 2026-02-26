@@ -1015,7 +1015,7 @@ impl eframe::App for App {
                         ui.label("Topic");
                         ui.text_edit_singleline(subscribe_topic);
                         ui.label("QoS");
-                        qos_picker(ui, "sub_qos", subscribe_qos);
+                        qos_picker(ui, &format!("sub_qos_{active_id}"), subscribe_qos);
                         if ui.button("Subscribe").clicked() {
                             let topic = subscribe_topic.trim().to_string();
                             if !topic.is_empty() {
@@ -1040,16 +1040,21 @@ impl eframe::App for App {
                     });
 
                     let mut remove_topic: Option<String> = None;
-                    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("subscriptions_scroll", active_id))
+                        .max_height(120.0)
+                        .show(ui, |ui| {
                         if subscriptions.is_empty() {
                             ui.label("No active subscriptions");
                         } else {
                             for entry in subscriptions.iter() {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("{} (QoS {})", entry.topic, entry.qos));
-                                    if ui.small_button("Remove").clicked() {
-                                        remove_topic = Some(entry.topic.clone());
-                                    }
+                                ui.push_id(&entry.topic, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{} (QoS {})", entry.topic, entry.qos));
+                                        if ui.small_button("Remove").clicked() {
+                                            remove_topic = Some(entry.topic.clone());
+                                        }
+                                    });
                                 });
                             }
                         }
@@ -1065,7 +1070,7 @@ impl eframe::App for App {
                         ui.label("Topic");
                         ui.text_edit_singleline(publish_topic);
                         ui.label("QoS");
-                        qos_picker(ui, "pub_qos", publish_qos);
+                        qos_picker(ui, &format!("pub_qos_{active_id}"), publish_qos);
                         ui.checkbox(publish_retain, "Retain");
                     });
                     ui.label("Payload");
@@ -1095,7 +1100,9 @@ impl eframe::App for App {
                         }
                     });
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt(("messages_scroll", active_id))
+                        .show(ui, |ui| {
                         let filter = topic_filter.trim();
                         let mut shown = 0usize;
 
