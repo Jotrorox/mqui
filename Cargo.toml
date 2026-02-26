@@ -3,6 +3,7 @@ name = "mqui"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/jotrorox/mqui"
 
 [dependencies]
 eframe = "0.33.3"
@@ -16,3 +17,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
