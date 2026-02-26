@@ -1,6 +1,12 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use eframe::egui;
+use mqtt_endpoint_tokio::mqtt_ep;
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabKind {
@@ -9,7 +15,10 @@ pub enum TabKind {
 
 #[derive(Clone, Debug)]
 pub enum TabState {
-    Client { mqtt_login: MqttLoginData },
+    Client {
+        mqtt_login: MqttLoginData,
+        connection_status: String,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -18,6 +27,53 @@ pub struct MqttLoginData {
     pub port: String,
     pub username: String,
     pub password: String,
+}
+
+impl MqttLoginData {
+    fn broker_addr(&self) -> String {
+        let broker = self.broker.trim();
+        if broker.is_empty() {
+            return "127.0.0.1:1883".to_string();
+        }
+
+        if broker.contains(':') {
+            broker.to_string()
+        } else {
+            let port = self.port.trim();
+            let port = if port.is_empty() { "1883" } else { port };
+            format!("{broker}:{port}")
+        }
+    }
+
+    fn username_opt(&self) -> Option<&str> {
+        let value = self.username.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn password_opt(&self) -> Option<&str> {
+        let value = self.password.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ClientHandle {
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    join_handle: JoinHandle<()>,
+    event_rx: Receiver<ClientEvent>,
+}
+
+#[derive(Debug)]
+enum ClientEvent {
+    Status(String),
 }
 
 #[derive(Clone, Debug)]
@@ -38,13 +94,33 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Default)]
 struct App {
     next_tab_id: u64,
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
     show_mqtt_popup: bool,
     mqtt_form: MqttLoginData,
+    runtime: Runtime,
+    clients: HashMap<u64, ClientHandle>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+
+        Self {
+            next_tab_id: 0,
+            tabs: Vec::new(),
+            active_tab: None,
+            show_mqtt_popup: false,
+            mqtt_form: MqttLoginData::default(),
+            runtime,
+            clients: HashMap::new(),
+        }
+    }
 }
 
 impl App {
@@ -59,7 +135,13 @@ impl App {
                 } else {
                     mqtt_login.broker.clone()
                 };
-                (title, TabState::Client { mqtt_login })
+                (
+                    title,
+                    TabState::Client {
+                        mqtt_login,
+                        connection_status: "Connecting...".to_string(),
+                    },
+                )
             }
         };
 
@@ -70,12 +152,16 @@ impl App {
             state,
         });
         self.active_tab = Some(id);
+
+        self.start_client(id);
     }
 
     fn close_tab(&mut self, tab_id: u64) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
+
+        self.stop_client(tab_id);
 
         self.tabs.remove(idx);
 
@@ -89,10 +175,148 @@ impl App {
             };
         }
     }
+
+    fn start_client(&mut self, tab_id: u64) {
+        let Some(login) = self.tabs.iter().find_map(|tab| {
+            if tab.id != tab_id {
+                return None;
+            }
+
+            match &tab.state {
+                TabState::Client { mqtt_login, .. } => Some(mqtt_login.clone()),
+            }
+        }) else {
+            return;
+        };
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let client_id = format!("mqui-client-{tab_id}");
+
+        let join_handle = self.runtime.spawn(async move {
+            let _ = event_tx.send(ClientEvent::Status("Connecting to broker...".to_string()));
+
+            let endpoint = mqtt_ep::endpoint::Endpoint::<mqtt_ep::role::Client>::new(
+                mqtt_ep::Version::V5_0,
+            );
+            let addr = login.broker_addr();
+
+            let connect_flow = async {
+                let tcp_stream =
+                    mqtt_ep::transport::connect_helper::connect_tcp(&addr, None)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                let transport = mqtt_ep::transport::TcpTransport::from_stream(tcp_stream);
+                endpoint
+                    .attach(transport, mqtt_ep::endpoint::Mode::Client)
+                    .await
+                    .map_err(|err| err.to_string())?;
+
+                let mut connect_builder = mqtt_ep::packet::v5_0::Connect::builder()
+                    .client_id(&client_id)
+                    .map_err(|err| err.to_string())?
+                    .keep_alive(60)
+                    .clean_start(true);
+
+                if let Some(username) = login.username_opt() {
+                    connect_builder = connect_builder
+                        .user_name(username)
+                        .map_err(|err| err.to_string())?;
+
+                    if let Some(password) = login.password_opt() {
+                        connect_builder = connect_builder
+                            .password(password.as_bytes().to_vec())
+                            .map_err(|err| err.to_string())?;
+                    }
+                }
+
+                let connect_packet = connect_builder.build().map_err(|err| err.to_string())?;
+
+                endpoint.send(connect_packet).await.map_err(|err| err.to_string())?;
+
+                let packet = endpoint.recv().await.map_err(|err| err.to_string())?;
+                Ok::<String, String>(format!("Connected: {packet:?}"))
+            };
+
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    let _ = endpoint.close().await;
+                    let _ = event_tx.send(ClientEvent::Status("Closed".to_string()));
+                }
+                result = connect_flow => {
+                    match result {
+                        Ok(msg) => {
+                            let _ = event_tx.send(ClientEvent::Status(msg));
+                            let _ = shutdown_rx.await;
+                            let _ = endpoint.close().await;
+                            let _ = event_tx.send(ClientEvent::Status("Closed".to_string()));
+                        }
+                        Err(err) => {
+                            let _ = event_tx.send(ClientEvent::Status(format!("Connection failed: {err}")));
+                            let _ = endpoint.close().await;
+                        }
+                    }
+                }
+            }
+        });
+
+        self.clients.insert(
+            tab_id,
+            ClientHandle {
+                shutdown_tx: Some(shutdown_tx),
+                join_handle,
+                event_rx,
+            },
+        );
+    }
+
+    fn stop_client(&mut self, tab_id: u64) {
+        if let Some(mut handle) = self.clients.remove(&tab_id) {
+            if let Some(shutdown_tx) = handle.shutdown_tx.take() {
+                let _ = shutdown_tx.send(());
+            }
+            let _ = handle.join_handle.is_finished();
+        }
+    }
+
+    fn pump_client_events(&mut self) {
+        for tab in &mut self.tabs {
+            let TabState::Client {
+                connection_status, ..
+            } = &mut tab.state;
+
+            let Some(client) = self.clients.get_mut(&tab.id) else {
+                continue;
+            };
+
+            loop {
+                match client.event_rx.try_recv() {
+                    Ok(ClientEvent::Status(status)) => *connection_status = status,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+    }
+
+    fn stop_all_clients(&mut self) {
+        let ids: Vec<u64> = self.clients.keys().copied().collect();
+        for id in ids {
+            self.stop_client(id);
+        }
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.stop_all_clients();
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_client_events();
+
         let top_bar_fill = ctx.style().visuals.panel_fill;
 
         egui::TopBottomPanel::top("tab_bar")
@@ -211,11 +435,14 @@ impl eframe::App for App {
                         ui.label("Port");
                         ui.text_edit_singleline(&mut self.mqtt_form.port);
 
-                        ui.label("Username");
+                        ui.label("Username (optional)");
                         ui.text_edit_singleline(&mut self.mqtt_form.username);
 
-                        ui.label("Password");
-                        ui.add(egui::TextEdit::singleline(&mut self.mqtt_form.password).password(true));
+                        ui.label("Password (optional)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.mqtt_form.password)
+                                .password(true),
+                        );
 
                         ui.add_space(8.0);
                         if ui.button("Add client").clicked() {
@@ -245,12 +472,27 @@ impl eframe::App for App {
             };
 
             match &mut tab.state {
-                TabState::Client { mqtt_login } => {
+                TabState::Client {
+                    mqtt_login,
+                    connection_status,
+                } => {
                     ui.heading("MQTT Login Data");
                     ui.label(format!("Broker: {}", mqtt_login.broker));
                     ui.label(format!("Port: {}", mqtt_login.port));
-                    ui.label(format!("Username: {}", mqtt_login.username));
-                    ui.label(format!("Password: {}", mqtt_login.password));
+                    ui.label(format!(
+                        "Username: {}",
+                        mqtt_login.username_opt().unwrap_or("<not set>")
+                    ));
+                    ui.label(format!(
+                        "Password: {}",
+                        if mqtt_login.password_opt().is_some() {
+                            "<set>"
+                        } else {
+                            "<not set>"
+                        }
+                    ));
+                    ui.separator();
+                    ui.label(format!("Client status: {connection_status}"));
                 }
             }
         });
