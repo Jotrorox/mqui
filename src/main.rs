@@ -9,7 +9,15 @@ pub enum TabKind {
 
 #[derive(Clone, Debug)]
 pub enum TabState {
-    Client { counter: i32 },
+    Client { mqtt_login: MqttLoginData },
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MqttLoginData {
+    pub broker: String,
+    pub port: String,
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Clone, Debug)]
@@ -35,15 +43,24 @@ struct App {
     next_tab_id: u64,
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
+    show_mqtt_popup: bool,
+    mqtt_form: MqttLoginData,
 }
 
 impl App {
-    fn new_tab(&mut self, kind: TabKind) {
+    fn new_tab(&mut self, kind: TabKind, mqtt_login: MqttLoginData) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
         let (title, state) = match kind {
-            TabKind::Client => ("Home".to_string(), TabState::Client { counter: 0 }),
+            TabKind::Client => {
+                let title = if mqtt_login.broker.is_empty() {
+                    format!("Client {id}")
+                } else {
+                    mqtt_login.broker.clone()
+                };
+                (title, TabState::Client { mqtt_login })
+            }
         };
 
         self.tabs.push(Tab {
@@ -174,13 +191,51 @@ impl eframe::App for App {
             }
 
             if add_tab {
-                self.new_tab(TabKind::Client);
+                self.show_mqtt_popup = true;
             }
         });
 
+        if self.show_mqtt_popup {
+            let mut open = self.show_mqtt_popup;
+            let mut create_client = false;
+
+            egui::Window::new("MQTT Login")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Broker");
+                        ui.text_edit_singleline(&mut self.mqtt_form.broker);
+
+                        ui.label("Port");
+                        ui.text_edit_singleline(&mut self.mqtt_form.port);
+
+                        ui.label("Username");
+                        ui.text_edit_singleline(&mut self.mqtt_form.username);
+
+                        ui.label("Password");
+                        ui.add(egui::TextEdit::singleline(&mut self.mqtt_form.password).password(true));
+
+                        ui.add_space(8.0);
+                        if ui.button("Add client").clicked() {
+                            create_client = true;
+                        }
+                    });
+                });
+
+            if create_client {
+                self.new_tab(TabKind::Client, self.mqtt_form.clone());
+                self.mqtt_form = MqttLoginData::default();
+                open = false;
+            }
+
+            self.show_mqtt_popup = open;
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let Some(active_id) = self.active_tab else {
-                ui.label("No tab open");
+                ui.label("No client open. Press + to add an MQTT client.");
                 return;
             };
 
@@ -190,12 +245,12 @@ impl eframe::App for App {
             };
 
             match &mut tab.state {
-                TabState::Client { counter } => {
-                    ui.heading("Home");
-                    if ui.button("Increment").clicked() {
-                        *counter += 1;
-                    }
-                    ui.label(format!("Counter: {counter}"));
+                TabState::Client { mqtt_login } => {
+                    ui.heading("MQTT Login Data");
+                    ui.label(format!("Broker: {}", mqtt_login.broker));
+                    ui.label(format!("Port: {}", mqtt_login.port));
+                    ui.label(format!("Username: {}", mqtt_login.username));
+                    ui.label(format!("Password: {}", mqtt_login.password));
                 }
             }
         });
