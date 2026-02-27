@@ -22,6 +22,12 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             let mut tab_to_activate = None;
             let mut tab_to_close = None;
+            let mut tab_to_disconnect = None;
+            let mut tab_to_force_disconnect = None;
+            let mut tab_to_reconnect = None;
+            let mut tab_to_duplicate = None;
+            let mut tab_to_rename: Option<(u64, String)> = None;
+            let mut tab_reorder: Option<(u64, u64)> = None;
             let mut add_tab = false;
 
             ui.horizontal(|ui| {
@@ -34,6 +40,8 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             for tab in &app.tabs {
+                                let tab_id = tab.id;
+                                let tab_title = tab.title.clone();
                                 let selected = app.active_tab == Some(tab.id);
                                 let frame_fill = if selected {
                                     ui.visuals().selection.bg_fill
@@ -63,11 +71,54 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                                             egui::Label::new(
                                                 egui::RichText::new(&tab.title).color(title_color),
                                             )
-                                            .sense(egui::Sense::click()),
+                                            .sense(egui::Sense::click_and_drag()),
                                         );
                                         if tab_response.clicked() {
-                                            tab_to_activate = Some(tab.id);
+                                            tab_to_activate = Some(tab_id);
                                         }
+
+                                        if tab_response.drag_started() {
+                                            app.dragging_tab = Some(tab_id);
+                                        }
+
+                                        if ui.input(|i| i.pointer.any_released())
+                                            && app.dragging_tab.is_some()
+                                            && tab_response.hovered()
+                                        {
+                                            if let Some(source_id) = app.dragging_tab {
+                                                if source_id != tab_id {
+                                                    tab_reorder = Some((source_id, tab_id));
+                                                }
+                                            }
+                                        }
+
+                                        tab_response.context_menu(|ui| {
+                                            if ui.button("Disconnect").clicked() {
+                                                tab_to_disconnect = Some(tab_id);
+                                                ui.close();
+                                            }
+                                            if ui.button("Force Disconnect").clicked() {
+                                                tab_to_force_disconnect = Some(tab_id);
+                                                ui.close();
+                                            }
+                                            if ui.button("Reconnect").clicked() {
+                                                tab_to_reconnect = Some(tab_id);
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui.button("Close Tab").clicked() {
+                                                tab_to_close = Some(tab_id);
+                                                ui.close();
+                                            }
+                                            if ui.button("Duplicate Tab").clicked() {
+                                                tab_to_duplicate = Some(tab_id);
+                                                ui.close();
+                                            }
+                                            if ui.button("Rename Tab").clicked() {
+                                                tab_to_rename = Some((tab_id, tab_title.clone()));
+                                                ui.close();
+                                            }
+                                        });
 
                                         if tab_response.hovered() || selected {
                                             let close_response = ui.add(
@@ -78,7 +129,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                                                 .frame(false),
                                             );
                                             if close_response.clicked() {
-                                                tab_to_close = Some(tab.id);
+                                                tab_to_close = Some(tab_id);
                                             }
                                         } else {
                                             ui.add_space(12.0);
@@ -103,14 +154,83 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                 app.active_tab = Some(id);
             }
 
+            if ui.input(|i| i.pointer.any_released()) {
+                app.dragging_tab = None;
+            }
+
+            if let Some((source_id, target_id)) = tab_reorder {
+                app.reorder_tabs(source_id, target_id);
+            }
+
             if let Some(id) = tab_to_close {
                 app.close_tab(id);
+            }
+
+            if let Some(id) = tab_to_disconnect {
+                app.disconnect_client(id);
+            }
+
+            if let Some(id) = tab_to_force_disconnect {
+                app.force_disconnect_client(id);
+            }
+
+            if let Some(id) = tab_to_reconnect {
+                app.reconnect_client(id);
+            }
+
+            if let Some(id) = tab_to_duplicate {
+                app.duplicate_tab(id);
+            }
+
+            if let Some((id, title)) = tab_to_rename {
+                app.renaming_tab = Some(id);
+                app.rename_buffer = title;
             }
 
             if add_tab {
                 app.show_mqtt_popup = true;
             }
         });
+
+    if let Some(tab_id) = app.renaming_tab {
+        let mut open = true;
+        let mut save = false;
+        let mut cancel_clicked = false;
+
+        egui::Window::new("Rename Tab")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Title");
+                let response = ui.text_edit_singleline(&mut app.rename_buffer);
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    save = true;
+                }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel_clicked = true;
+                    }
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                });
+            });
+
+        if cancel_clicked {
+            open = false;
+        }
+
+        if save {
+            app.rename_tab(tab_id, app.rename_buffer.clone());
+            app.renaming_tab = None;
+            app.rename_buffer.clear();
+        } else if !open {
+            app.renaming_tab = None;
+            app.rename_buffer.clear();
+        }
+    }
 
     if app.show_mqtt_popup {
         let mut open = app.show_mqtt_popup;

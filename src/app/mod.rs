@@ -17,6 +17,9 @@ pub struct App {
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active_tab: Option<u64>,
     pub(crate) show_mqtt_popup: bool,
+    pub(crate) renaming_tab: Option<u64>,
+    pub(crate) rename_buffer: String,
+    pub(crate) dragging_tab: Option<u64>,
     pub(crate) mqtt_form: MqttLoginData,
     pub(crate) runtime: Runtime,
     pub(crate) clients: HashMap<u64, ClientHandle>,
@@ -34,6 +37,9 @@ impl Default for App {
             tabs: Vec::new(),
             active_tab: None,
             show_mqtt_popup: false,
+            renaming_tab: None,
+            rename_buffer: String::new(),
+            dragging_tab: None,
             mqtt_form: MqttLoginData::default(),
             runtime,
             clients: HashMap::new(),
@@ -101,6 +107,80 @@ impl App {
                 Some(self.tabs[0].id)
             };
         }
+    }
+
+    pub(crate) fn disconnect_client(&mut self, tab_id: u64) {
+        self.send_client_command(tab_id, ClientCommand::Disconnect);
+    }
+
+    pub(crate) fn force_disconnect_client(&mut self, tab_id: u64) {
+        self.send_client_command(tab_id, ClientCommand::ForceDisconnect);
+    }
+
+    pub(crate) fn reconnect_client(&mut self, tab_id: u64) {
+        self.stop_client(tab_id);
+
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            let TabState::Client {
+                connection_status,
+                last_error,
+                ..
+            } = &mut tab.state;
+            *connection_status = "Reconnecting...".to_string();
+            *last_error = None;
+        }
+
+        self.start_client(tab_id);
+    }
+
+    pub(crate) fn duplicate_tab(&mut self, tab_id: u64) {
+        let Some((title, login)) = self.tabs.iter().find_map(|tab| {
+            if tab.id != tab_id {
+                return None;
+            }
+
+            let TabState::Client { mqtt_login, .. } = &tab.state;
+            Some((tab.title.clone(), mqtt_login.clone()))
+        }) else {
+            return;
+        };
+
+        self.new_tab(TabKind::Client, login);
+        if let Some(new_tab) = self.tabs.last_mut() {
+            new_tab.title = format!("{title} copy");
+        }
+    }
+
+    pub(crate) fn rename_tab(&mut self, tab_id: u64, new_title: String) {
+        let title = new_title.trim();
+        if title.is_empty() {
+            return;
+        }
+
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.title = title.to_string();
+        }
+    }
+
+    pub(crate) fn reorder_tabs(&mut self, source_id: u64, target_id: u64) {
+        if source_id == target_id {
+            return;
+        }
+
+        let Some(source_idx) = self.tabs.iter().position(|tab| tab.id == source_id) else {
+            return;
+        };
+        let Some(target_idx) = self.tabs.iter().position(|tab| tab.id == target_id) else {
+            return;
+        };
+
+        let tab = self.tabs.remove(source_idx);
+        let insertion_idx = if source_idx < target_idx {
+            target_idx - 1
+        } else {
+            target_idx
+        };
+        self.tabs.insert(insertion_idx, tab);
     }
 
     fn start_client(&mut self, tab_id: u64) {

@@ -151,6 +151,27 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                     };
 
                     match command {
+                        ClientCommand::Disconnect => {
+                            let disconnect_packet = mqtt_ep::packet::v5_0::Disconnect::builder()
+                                .build();
+
+                            if let Ok(packet) = disconnect_packet {
+                                let _ = endpoint.send(packet).await;
+                            }
+
+                            let _ = endpoint.close().await;
+                            let _ = event_tx.send(ClientEvent::Disconnected(
+                                "Disconnected by user".to_string(),
+                            ));
+                            break;
+                        }
+                        ClientCommand::ForceDisconnect => {
+                            let _ = endpoint.close().await;
+                            let _ = event_tx.send(ClientEvent::Disconnected(
+                                "Force disconnected by user".to_string(),
+                            ));
+                            break;
+                        }
                         ClientCommand::Subscribe { topic, qos } => {
                             let qos_level = match mqtt_ep::packet::Qos::try_from(qos) {
                                 Ok(level) => level,

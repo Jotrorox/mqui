@@ -27,6 +27,8 @@ pub(crate) enum ClientEvent {
 
 #[derive(Debug)]
 pub(crate) enum ClientCommand {
+    Disconnect,
+    ForceDisconnect,
     Subscribe { topic: String, qos: u8 },
     Unsubscribe { topic: String },
     Publish {
