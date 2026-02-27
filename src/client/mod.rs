@@ -69,6 +69,32 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
             }
         }
 
+        if let Some(testament) = login.testament_and_last_will_opt() {
+            let will_topic = login
+                .testament_topic_opt()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("mqui/{client_id}/last-will"));
+            let will_qos = match mqtt_ep::packet::Qos::try_from(login.testament_qos) {
+                Ok(qos) => qos,
+                Err(_) => mqtt_ep::packet::Qos::AtMostOnce,
+            };
+            connect_builder = match connect_builder.will_message(
+                &will_topic,
+                testament.as_bytes().to_vec(),
+                will_qos,
+                login.testament_retain,
+            ) {
+                Ok(builder) => builder,
+                Err(err) => {
+                    let _ = event_tx.send(ClientEvent::Disconnected(format!(
+                        "Last Will setup failed: {err}"
+                    )));
+                    let _ = endpoint.close().await;
+                    return;
+                }
+            };
+        }
+
         let connect_packet = match connect_builder.build() {
             Ok(packet) => packet,
             Err(err) => {

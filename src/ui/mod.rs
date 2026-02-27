@@ -128,11 +128,37 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                     ui.label("Port");
                     ui.text_edit_singleline(&mut app.mqtt_form.port);
 
-                    ui.label("Username (optional)");
-                    ui.text_edit_singleline(&mut app.mqtt_form.username);
+                    egui::CollapsingHeader::new("Login credentials")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label("Username (optional)");
+                            ui.text_edit_singleline(&mut app.mqtt_form.username);
 
-                    ui.label("Password (optional)");
-                    ui.add(egui::TextEdit::singleline(&mut app.mqtt_form.password).password(true));
+                            ui.label("Password (optional)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut app.mqtt_form.password)
+                                    .password(true),
+                            );
+                        });
+
+                    egui::CollapsingHeader::new("Testament")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label("Topic (optional)");
+                            ui.text_edit_singleline(&mut app.mqtt_form.testament_topic);
+
+                            ui.horizontal(|ui| {
+                                ui.label("QoS");
+                                ui.add(
+                                    egui::DragValue::new(&mut app.mqtt_form.testament_qos)
+                                        .range(0..=2),
+                                );
+                                ui.checkbox(&mut app.mqtt_form.testament_retain, "Retain");
+                            });
+
+                            ui.label("testament and last will");
+                            ui.text_edit_singleline(&mut app.mqtt_form.testament_and_last_will);
+                        });
 
                     ui.add_space(8.0);
                     if ui.button("Add client").clicked() {

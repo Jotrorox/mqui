@@ -8,6 +8,10 @@ pub(crate) struct MqttLoginData {
     pub(crate) port: String,
     pub(crate) username: String,
     pub(crate) password: String,
+    pub(crate) testament_and_last_will: String,
+    pub(crate) testament_topic: String,
+    pub(crate) testament_qos: u8,
+    pub(crate) testament_retain: bool,
 }
 
 impl MqttLoginData {
@@ -37,6 +41,24 @@ impl MqttLoginData {
 
     pub(crate) fn password_opt(&self) -> Option<&str> {
         let value = self.password.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    pub(crate) fn testament_and_last_will_opt(&self) -> Option<&str> {
+        let value = self.testament_and_last_will.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    pub(crate) fn testament_topic_opt(&self) -> Option<&str> {
+        let value = self.testament_topic.trim();
         if value.is_empty() {
             None
         } else {
