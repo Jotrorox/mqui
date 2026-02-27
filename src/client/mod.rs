@@ -13,7 +13,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
     let (event_tx, event_rx) = mpsc::channel();
     let (command_tx, mut command_rx) = tokio_mpsc::unbounded_channel::<ClientCommand>();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let client_id = format!("mqui-client-{tab_id}");
+    let client_id = format!("mqui-client-{}-{tab_id}", std::process::id());
 
     let join_handle = runtime.spawn(async move {
         let _ = event_tx.send(ClientEvent::Status("Connecting to broker...".to_string()));
