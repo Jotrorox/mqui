@@ -242,6 +242,9 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
+                    ui.label("Name (optional)");
+                    ui.text_edit_singleline(&mut app.mqtt_form.name);
+
                     ui.label("Broker");
                     ui.text_edit_singleline(&mut app.mqtt_form.broker);
 

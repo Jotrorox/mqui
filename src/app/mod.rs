@@ -54,7 +54,10 @@ impl App {
 
         let (title, state) = match kind {
             TabKind::Client => {
-                let title = if mqtt_login.broker.is_empty() {
+                let custom_name = mqtt_login.name.trim();
+                let title = if !custom_name.is_empty() {
+                    custom_name.to_string()
+                } else if mqtt_login.broker.is_empty() {
                     format!("Client {id}")
                 } else {
                     mqtt_login.broker.clone()

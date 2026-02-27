@@ -4,6 +4,7 @@ pub(crate) const MAX_STORED_MESSAGES: usize = 1000;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MqttLoginData {
+    pub(crate) name: String,
     pub(crate) broker: String,
     pub(crate) port: String,
     pub(crate) username: String,
