@@ -9,11 +9,11 @@ repository = "https://github.com/jotrorox/mqui"
 eframe = "0.33.3"
 egui = "0.33.3"
 mqtt-endpoint-tokio = "0.6.5"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
-directories = "5"
-rfd = "0.15"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "sync", "macros"] }
+directories = "6"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.3+spec-1.1.0"
 
 [profile.release]
 opt-level = 3
