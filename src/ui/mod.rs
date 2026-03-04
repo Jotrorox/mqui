@@ -1,4 +1,6 @@
 use eframe::egui;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::app::App;
 use crate::app::state::{TabKind, TabState};
@@ -8,6 +10,45 @@ use crate::ui::widgets::qos_picker;
 use crate::utils::formatting::{format_payload, format_timestamp};
 
 pub(crate) mod widgets;
+
+fn topic_color_for(topic: &str, visuals: &egui::Visuals) -> egui::Color32 {
+    let palette = [
+        visuals.selection.bg_fill,
+        visuals.hyperlink_color,
+        visuals.warn_fg_color,
+        visuals.widgets.active.fg_stroke.color,
+        visuals.widgets.hovered.fg_stroke.color,
+        visuals.widgets.inactive.fg_stroke.color,
+    ];
+
+    let mut hasher = DefaultHasher::new();
+    topic.hash(&mut hasher);
+    let index = (hasher.finish() as usize) % palette.len();
+    palette[index]
+}
+
+fn topic_label(ui: &mut egui::Ui, topic: &str, color: egui::Color32) {
+    if topic.is_empty() {
+        ui.label(egui::RichText::new("(empty)").weak());
+        return;
+    }
+
+    let wildcard_color = ui.visuals().warn_fg_color;
+    let mut first = true;
+    for segment in topic.split('/') {
+        if !first {
+            ui.label(egui::RichText::new("/").color(color));
+        }
+        first = false;
+
+        let segment_color = if segment == "+" || segment == "#" {
+            wildcard_color
+        } else {
+            color
+        };
+        ui.label(egui::RichText::new(segment).color(segment_color));
+    }
+}
 
 pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
     let top_bar_fill = ctx.style().visuals.panel_fill;
@@ -387,6 +428,9 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                 subscribe_topic,
                 subscribe_qos,
                 unsubscribe_topic,
+                editing_subscription_topic,
+                editing_subscription_value,
+                editing_subscription_qos,
                 publish_topic,
                 publish_qos,
                 publish_retain,
@@ -441,6 +485,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                 });
 
                 let mut remove_topic: Option<String> = None;
+                let mut edit_topic: Option<(String, u8)> = None;
                 egui::ScrollArea::vertical()
                     .id_salt(("subscriptions_scroll", active_id))
                     .max_height(120.0)
@@ -449,22 +494,118 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                             ui.label("No active subscriptions");
                         } else {
                             for entry in subscriptions.iter() {
-                                ui.push_id(&entry.topic, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{} (QoS {})", entry.topic, entry.qos));
-                                        if ui.small_button("Remove").clicked() {
+                                ui.push_id((&entry.topic, entry.qos), |ui| {
+                                    let row_response = ui
+                                        .horizontal(|ui| {
+                                            let color = topic_color_for(&entry.topic, ui.visuals());
+                                            topic_label(ui, &entry.topic, color);
+                                            ui.label(format!("(QoS {})", entry.qos));
+                                            if ui.small_button("Remove").clicked() {
+                                                remove_topic = Some(entry.topic.clone());
+                                            }
+                                        })
+                                        .response;
+
+                                    row_response.context_menu(|ui| {
+                                        if ui.button("Edit Subscription").clicked() {
+                                            edit_topic = Some((entry.topic.clone(), entry.qos));
+                                            ui.close();
+                                        }
+                                        if ui.button("Unsubscribe").clicked() {
                                             remove_topic = Some(entry.topic.clone());
+                                            ui.close();
                                         }
                                     });
                                 });
                             }
                         }
                     });
+                if let Some((topic, qos)) = edit_topic {
+                    *editing_subscription_topic = Some(topic.clone());
+                    *editing_subscription_value = topic;
+                    *editing_subscription_qos = qos;
+                }
                 if let Some(topic) = remove_topic {
                     commands_to_send.push(ClientCommand::Unsubscribe {
                         topic: topic.clone(),
                     });
                     *unsubscribe_topic = topic;
+                }
+
+                if let Some(original_topic) = editing_subscription_topic.clone() {
+                    let mut open = true;
+                    let mut apply = false;
+                    let mut cancel_clicked = false;
+
+                    egui::Window::new("Edit Subscription")
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut open)
+                        .show(ctx, |ui| {
+                            ui.label("Topic");
+                            let response = ui.text_edit_singleline(editing_subscription_value);
+                            if response.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            {
+                                apply = true;
+                            }
+
+                            ui.horizontal(|ui| {
+                                ui.label("QoS");
+                                qos_picker(
+                                    ui,
+                                    &format!("edit_sub_qos_{active_id}"),
+                                    editing_subscription_qos,
+                                );
+                            });
+
+                            ui.horizontal(|ui| {
+                                if ui.button("Cancel").clicked() {
+                                    cancel_clicked = true;
+                                }
+                                if ui.button("Apply").clicked() {
+                                    apply = true;
+                                }
+                            });
+                        });
+
+                    if cancel_clicked {
+                        open = false;
+                    }
+
+                    if apply {
+                        let new_topic = editing_subscription_value.trim().to_string();
+                        if new_topic.is_empty() {
+                            *last_error = Some("Subscription topic cannot be empty".to_string());
+                        } else {
+                            let mut changed = new_topic != original_topic;
+                            if !changed
+                                && let Some(existing) =
+                                    subscriptions.iter().find(|entry| entry.topic == original_topic)
+                            {
+                                changed = existing.qos != *editing_subscription_qos;
+                            }
+
+                            if changed {
+                                commands_to_send.push(ClientCommand::Unsubscribe {
+                                    topic: original_topic.clone(),
+                                });
+                                commands_to_send.push(ClientCommand::Subscribe {
+                                    topic: new_topic.clone(),
+                                    qos: *editing_subscription_qos,
+                                });
+                                *unsubscribe_topic = original_topic;
+                                *subscribe_topic = new_topic;
+                                *subscribe_qos = *editing_subscription_qos;
+                            }
+
+                            *editing_subscription_topic = None;
+                            editing_subscription_value.clear();
+                        }
+                    } else if !open {
+                        *editing_subscription_topic = None;
+                        editing_subscription_value.clear();
+                    }
                 }
 
                 ui.separator();
@@ -520,7 +661,11 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                             let ts = format_timestamp(msg.timestamp);
                             let payload_text = format_payload(&msg.payload, *payload_view_hex);
                             ui.group(|ui| {
-                                ui.label(format!("[{ts}] {}", msg.topic));
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(format!("[{ts}] "));
+                                    let color = topic_color_for(&msg.topic, ui.visuals());
+                                    topic_label(ui, &msg.topic, color);
+                                });
                                 ui.label(format!("QoS {} | retain {}", msg.qos, msg.retain));
                                 ui.label(payload_text);
                             });
