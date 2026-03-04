@@ -27,17 +27,26 @@ fn topic_color_for(topic: &str, visuals: &egui::Visuals) -> egui::Color32 {
     palette[index]
 }
 
-fn topic_label(ui: &mut egui::Ui, topic: &str, color: egui::Color32) {
+fn topic_label(ui: &mut egui::Ui, topic: &str, color: egui::Color32) -> egui::Response {
     if topic.is_empty() {
-        ui.label(egui::RichText::new("(empty)").weak());
-        return;
+        return ui.add(
+            egui::Label::new(egui::RichText::new("(empty)").weak()).sense(egui::Sense::click()),
+        );
     }
 
     let wildcard_color = ui.visuals().warn_fg_color;
+    let mut job = egui::text::LayoutJob::default();
     let mut first = true;
     for segment in topic.split('/') {
         if !first {
-            ui.label(egui::RichText::new("/").color(color));
+            job.append(
+                "/",
+                0.0,
+                egui::TextFormat {
+                    color,
+                    ..Default::default()
+                },
+            );
         }
         first = false;
 
@@ -46,8 +55,18 @@ fn topic_label(ui: &mut egui::Ui, topic: &str, color: egui::Color32) {
         } else {
             color
         };
-        ui.label(egui::RichText::new(segment).color(segment_color));
+
+        job.append(
+            segment,
+            0.0,
+            egui::TextFormat {
+                color: segment_color,
+                ..Default::default()
+            },
+        );
     }
+
+    ui.add(egui::Label::new(job).sense(egui::Sense::click()))
 }
 
 pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
@@ -495,16 +514,20 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                         } else {
                             for entry in subscriptions.iter() {
                                 ui.push_id((&entry.topic, entry.qos), |ui| {
-                                    let row_response = ui
+                                    let (topic_response, qos_response) = ui
                                         .horizontal(|ui| {
                                             let color = topic_color_for(&entry.topic, ui.visuals());
-                                            topic_label(ui, &entry.topic, color);
-                                            ui.label(format!("(QoS {})", entry.qos));
+                                            let topic_response = topic_label(ui, &entry.topic, color);
+                                            let qos_response = ui
+                                                .add(egui::Label::new(format!("(QoS {})", entry.qos)).sense(egui::Sense::click()));
                                             if ui.small_button("Remove").clicked() {
                                                 remove_topic = Some(entry.topic.clone());
                                             }
+                                            (topic_response, qos_response)
                                         })
-                                        .response;
+                                        .inner;
+
+                                    let row_response = topic_response.union(qos_response);
 
                                     row_response.context_menu(|ui| {
                                         if ui.button("Edit Subscription").clicked() {
