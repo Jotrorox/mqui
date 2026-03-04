@@ -181,7 +181,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                                         if tab_response.hovered() || selected {
                                             let close_response = ui.add(
                                                 egui::Button::new(
-                                                    egui::RichText::new("✕").small().strong(),
+                                                    egui::RichText::new("x").small().strong(),
                                                 )
                                                 .small()
                                                 .frame(false),
@@ -488,17 +488,6 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                                 qos: *subscribe_qos,
                             });
                             *unsubscribe_topic = topic;
-                        }
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Unsubscribe topic");
-                    ui.text_edit_singleline(unsubscribe_topic);
-                    if ui.button("Unsubscribe").clicked() {
-                        let topic = unsubscribe_topic.trim().to_string();
-                        if !topic.is_empty() {
-                            commands_to_send.push(ClientCommand::Unsubscribe { topic });
                         }
                     }
                 });
