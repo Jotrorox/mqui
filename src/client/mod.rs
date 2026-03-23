@@ -1,13 +1,217 @@
 use mqtt_endpoint_tokio::mqtt_ep;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::{Arc, Once};
 use std::sync::mpsc;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+use tokio_tungstenite::client_async;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::http::Request;
 
 use crate::models::client::ClientHandle;
 use crate::models::ipc::{ClientCommand, ClientEvent};
-use crate::models::mqtt::MqttLoginData;
+use crate::models::mqtt::{MqttLoginData, TlsVerificationMode, TransportKind};
 use crate::utils::qos::qos_to_u8;
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+#[derive(Debug)]
+struct InsecureServerCertVerifier;
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
+fn ensure_rustls_crypto_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn build_tls_config(login: &MqttLoginData, domain: &str) -> Result<Option<Arc<ClientConfig>>, String> {
+    if domain.trim().is_empty() {
+        return Err("TLS transport requires a non-empty server name".to_string());
+    }
+
+    ensure_rustls_crypto_provider();
+
+    match login.tls_verification {
+        TlsVerificationMode::SystemRoots => Ok(None),
+        TlsVerificationMode::CustomCa => {
+            let path = login.tls_ca_cert_path.trim();
+            if path.is_empty() {
+                return Err("Custom CA verification requires a CA PEM file path".to_string());
+            }
+
+            let mut root_store = RootCertStore::empty();
+            let cert_result = rustls_native_certs::load_native_certs();
+            for cert in cert_result.certs {
+                let _ = root_store.add(cert);
+            }
+
+            let file = File::open(path)
+                .map_err(|err| format!("Failed to open CA PEM file '{path}': {err}"))?;
+            let mut reader = BufReader::new(file);
+            let mut found_cert = false;
+            for cert in rustls_pemfile::certs(&mut reader) {
+                let cert = cert
+                    .map_err(|err| format!("Failed to read CA PEM file '{path}': {err}"))?;
+                root_store.add(cert).map_err(|err| {
+                    format!("Failed to add certificate from CA PEM file '{path}': {err}")
+                })?;
+                found_cert = true;
+            }
+
+            if !found_cert {
+                return Err(format!("CA PEM file '{path}' did not contain any certificates"));
+            }
+
+            Ok(Some(Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(root_store)
+                    .with_no_client_auth(),
+            )))
+        }
+        TlsVerificationMode::InsecureSkipVerify => Ok(Some(Arc::new(
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier))
+                .with_no_client_auth(),
+        ))),
+    }
+}
+
+fn build_websocket_request(addr: &str, path: &str) -> Result<Request<()>, String> {
+    let url = format!("ws://{addr}{path}");
+    Request::builder()
+        .uri(&url)
+        .header("Host", addr)
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Key", generate_key())
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Protocol", "mqtt")
+        .body(())
+        .map_err(|err| format!("Failed to build WebSocket request: {err}"))
+}
+
+async fn connect_transport(
+    login: &MqttLoginData,
+) -> Result<(Box<dyn mqtt_ep::transport::TransportOps + Send>, String), String> {
+    let resolved = login.resolve_connection()?;
+    let transport: Box<dyn mqtt_ep::transport::TransportOps + Send> = match resolved.transport {
+        TransportKind::Tcp => {
+            let stream = mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+                .await
+                .map_err(|err| format!("TCP connect failed: {err}"))?;
+            Box::new(mqtt_ep::transport::TcpTransport::from_stream(stream))
+        }
+        TransportKind::Tls => {
+            let domain = resolved
+                .tls_domain
+                .as_deref()
+                .ok_or_else(|| "TLS transport requires a server name".to_string())?;
+            let tls_config = build_tls_config(login, domain)?;
+            let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls(
+                &resolved.addr,
+                domain,
+                tls_config,
+                None,
+            )
+            .await
+            .map_err(|err| format!("TLS connect failed: {err}"))?;
+            Box::new(mqtt_ep::transport::TlsTransport::from_stream(stream))
+        }
+        TransportKind::Ws => {
+            let path = resolved
+                .ws_path
+                .as_deref()
+                .ok_or_else(|| "WebSocket transport requires a path".to_string())?;
+            let tcp_stream = mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+                .await
+                .map_err(|err| format!("WebSocket TCP connect failed: {err}"))?;
+            let request = build_websocket_request(&resolved.addr, path)?;
+            let (stream, _response) = client_async(request, tcp_stream)
+            .await
+            .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+            Box::new(mqtt_ep::transport::WebSocketTransport::from_tcp_client_stream(stream))
+        }
+        TransportKind::Wss => {
+            let domain = resolved
+                .tls_domain
+                .as_deref()
+                .ok_or_else(|| "Secure WebSocket transport requires a server name".to_string())?;
+            let path = resolved
+                .ws_path
+                .as_deref()
+                .ok_or_else(|| "Secure WebSocket transport requires a path".to_string())?;
+            let tls_config = build_tls_config(login, domain)?;
+            let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls_ws(
+                &resolved.addr,
+                domain,
+                path,
+                tls_config,
+                None,
+                None,
+            )
+            .await
+            .map_err(|err| format!("Secure WebSocket connect failed: {err}"))?;
+            Box::new(mqtt_ep::transport::WebSocketTransport::from_tls_client_stream(stream))
+        }
+    };
+
+    Ok((transport, resolved.display_label))
+}
 
 pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData) -> ClientHandle {
     let (event_tx, event_rx) = mpsc::channel();
@@ -17,20 +221,29 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
     let keep_alive_secs = login.effective_keep_alive_secs();
 
     let join_handle = runtime.spawn(async move {
-        let _ = event_tx.send(ClientEvent::Status("Connecting to broker...".to_string()));
-
-        let endpoint = mqtt_ep::endpoint::Endpoint::<mqtt_ep::role::Client>::new(mqtt_ep::Version::V5_0);
-        let addr = login.broker_addr();
-
-        let tcp_stream = match mqtt_ep::transport::connect_helper::connect_tcp(&addr, None).await {
-            Ok(stream) => stream,
+        let resolved = match login.resolve_connection() {
+            Ok(resolved) => resolved,
             Err(err) => {
-                let _ = event_tx.send(ClientEvent::Disconnected(format!("TCP connect failed: {err}")));
+                let _ = event_tx.send(ClientEvent::Disconnected(format!(
+                    "Invalid connection settings: {err}"
+                )));
                 return;
             }
         };
+        let _ = event_tx.send(ClientEvent::Status(format!(
+            "Connecting via {} to {}",
+            resolved.transport.label(),
+            resolved.display_label
+        )));
 
-        let transport = mqtt_ep::transport::TcpTransport::from_stream(tcp_stream);
+        let endpoint = mqtt_ep::endpoint::Endpoint::<mqtt_ep::role::Client>::new(mqtt_ep::Version::V5_0);
+        let (transport, display_label) = match connect_transport(&login).await {
+            Ok(transport) => transport,
+            Err(err) => {
+                let _ = event_tx.send(ClientEvent::Disconnected(err));
+                return;
+            }
+        };
         if let Err(err) = endpoint
             .attach(transport, mqtt_ep::endpoint::Mode::Client)
             .await
@@ -123,7 +336,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
         match connack {
             mqtt_ep::packet::Packet::V5_0Connack(_) => {
                 let _ = event_tx.send(ClientEvent::Connected);
-                let _ = event_tx.send(ClientEvent::Status(format!("Connected to {addr}")));
+                let _ = event_tx.send(ClientEvent::Status(format!("Connected to {display_label}")));
             }
             other => {
                 let _ = event_tx.send(ClientEvent::Disconnected(format!(
