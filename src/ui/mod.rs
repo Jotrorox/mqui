@@ -69,17 +69,18 @@ fn topic_label(ui: &mut egui::Ui, topic: &str, color: egui::Color32) -> egui::Re
     ui.add(egui::Label::new(job).sense(egui::Sense::click()))
 }
 
-pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
-    let top_bar_fill = ctx.style().visuals.panel_fill;
+pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    let top_bar_fill = ui.style().visuals.panel_fill;
 
-    egui::TopBottomPanel::top("tab_bar")
-        .exact_height(40.0)
+    egui::Panel::top("tab_bar")
+        .exact_size(40.0)
         .frame(
             egui::Frame::new()
                 .fill(top_bar_fill)
                 .inner_margin(egui::Margin::symmetric(6, 5)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             let mut tab_to_activate = None;
             let mut tab_to_close = None;
             let mut tab_to_disconnect = None;
@@ -259,7 +260,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 ui.label("Title");
                 let response = ui.text_edit_singleline(&mut app.rename_buffer);
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -301,7 +302,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 ui.vertical(|ui| {
                     if let Some(status) = &app.profile_status {
                         ui.label(status);
@@ -553,7 +554,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
         app.show_mqtt_popup = open;
     }
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         let Some(active_id) = app.active_tab else {
             ui.label("No client open. Press + to add an MQTT client.");
             return;
@@ -686,7 +687,7 @@ pub(crate) fn render(app: &mut App, ctx: &egui::Context) {
                         .collapsible(false)
                         .resizable(false)
                         .open(&mut open)
-                        .show(ctx, |ui| {
+                        .show(&ctx, |ui| {
                             ui.label("Topic");
                             let response = ui.text_edit_singleline(editing_subscription_value);
                             if response.lost_focus()

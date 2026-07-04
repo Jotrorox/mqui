@@ -362,9 +362,9 @@ impl Drop for App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         events::pump_client_events(self);
-        crate::ui::render(self, ctx);
-        ctx.request_repaint();
+        crate::ui::render(self, ui);
+        ui.ctx().request_repaint();
     }
 }

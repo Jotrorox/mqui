@@ -6,19 +6,20 @@ license = "MIT"
 repository = "https://github.com/jotrorox/mqui"
 
 [dependencies]
-eframe = "0.33.3"
-egui = "0.33.3"
+eframe = "0.35.0"
+egui = "0.35.0"
 mqtt-endpoint-tokio = "0.6.5"
-tokio = { version = "1.50.0", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "sync", "macros"] }
 directories = "6"
 rfd = "0.17.2"
-rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
-rustls-native-certs = "0.8.3"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
+# Must match mqtt-endpoint-tokio's public WebSocket transport types.
 tokio-tungstenite = "0.20.1"
-toml = "1.0.3"
-url = "2.5.7"
+toml = "1.1.2"
+url = "2.5.8"
 
 [profile.release]
 opt-level = 3
