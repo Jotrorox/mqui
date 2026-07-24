@@ -3,7 +3,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Once};
 use tokio::runtime::Runtime;
@@ -18,6 +18,95 @@ use crate::models::mqtt::{MqttLoginData, TlsVerificationMode, TransportKind};
 use crate::utils::qos::qos_to_u8;
 
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+#[derive(Debug, PartialEq, Eq)]
+enum OutgoingPublishState {
+    Puback { topic: String },
+    Pubrec { topic: String },
+    Pubcomp { topic: String },
+}
+
+impl OutgoingPublishState {
+    fn after_successful_pubrec(self) -> Result<Self, Self> {
+        match self {
+            Self::Pubrec { topic } => Ok(Self::Pubcomp { topic }),
+            other => Err(other),
+        }
+    }
+
+    fn complete_with_puback(self) -> Result<String, Self> {
+        match self {
+            Self::Puback { topic } => Ok(topic),
+            other => Err(other),
+        }
+    }
+
+    fn complete_with_pubcomp(self) -> Result<String, Self> {
+        match self {
+            Self::Pubcomp { topic } => Ok(topic),
+            other => Err(other),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IncomingQos2Message {
+    topic: String,
+    qos: u8,
+    retain: bool,
+    payload: Vec<u8>,
+}
+
+fn connack_error(code: mqtt_ep::result_code::ConnectReasonCode) -> Option<String> {
+    use mqtt_ep::result_code::ConnectReasonCode;
+
+    match code {
+        ConnectReasonCode::Success => None,
+        ConnectReasonCode::BadUserNameOrPassword => {
+            Some("broker rejected the username or password".to_string())
+        }
+        ConnectReasonCode::NotAuthorized => {
+            Some("broker denied authorization for this connection".to_string())
+        }
+        other => Some(format!("broker rejected the connection: {other}")),
+    }
+}
+
+fn suback_result(codes: &[mqtt_ep::result_code::SubackReasonCode]) -> Result<(u8, String), String> {
+    use mqtt_ep::result_code::SubackReasonCode;
+
+    let [code] = codes else {
+        return Err(format!(
+            "expected exactly one reason code, received {}",
+            codes.len()
+        ));
+    };
+    let qos = match code {
+        SubackReasonCode::GrantedQos0 => 0,
+        SubackReasonCode::GrantedQos1 => 1,
+        SubackReasonCode::GrantedQos2 => 2,
+        other => return Err(format!("{other}")),
+    };
+    Ok((qos, code.to_string()))
+}
+
+fn unsuback_result(codes: &[mqtt_ep::result_code::UnsubackReasonCode]) -> Result<String, String> {
+    let [code] = codes else {
+        return Err(format!(
+            "expected exactly one reason code, received {}",
+            codes.len()
+        ));
+    };
+    if code.is_success() {
+        Ok(code.to_string())
+    } else {
+        Err(code.to_string())
+    }
+}
+
+fn optional_reason_is_success<T>(code: Option<T>, is_success: impl FnOnce(&T) -> bool) -> bool {
+    code.as_ref().is_none_or(is_success)
+}
 
 #[derive(Debug)]
 struct InsecureServerCertVerifier;
@@ -337,9 +426,17 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
         };
 
         match connack {
-            mqtt_ep::packet::Packet::V5_0Connack(_) => {
+            mqtt_ep::packet::Packet::V5_0Connack(connack) => {
+                if let Some(err) = connack_error(connack.reason_code()) {
+                    let _ = event_tx.send(ClientEvent::Disconnected(format!(
+                        "CONNACK rejected: {err}"
+                    )));
+                    let _ = endpoint.close().await;
+                    return;
+                }
                 let _ = event_tx.send(ClientEvent::Connected);
-                let _ = event_tx.send(ClientEvent::Status(format!("Connected to {display_label}")));
+                let _ =
+                    event_tx.send(ClientEvent::Status(format!("Connected to {display_label}")));
             }
             other => {
                 let _ = event_tx.send(ClientEvent::Disconnected(format!(
@@ -353,7 +450,9 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
 
         let mut pending_subscribe: HashMap<u16, (String, u8)> = HashMap::new();
         let mut pending_unsubscribe: HashMap<u16, String> = HashMap::new();
-        let mut pending_publish: HashMap<u16, (String, bool)> = HashMap::new();
+        let mut pending_publish: HashMap<u16, OutgoingPublishState> = HashMap::new();
+        let mut incoming_qos2: HashMap<u16, IncomingQos2Message> = HashMap::new();
+        let mut completed_incoming_qos2: HashSet<u16> = HashSet::new();
 
         loop {
             tokio::select! {
@@ -411,6 +510,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                 Ok(entry) => entry,
                                 Err(err) => {
                                     let _ = event_tx.send(ClientEvent::Error(format!("Invalid subscription topic '{topic}': {err}")));
+                                    let _ = endpoint.release_packet_id(packet_id).await;
                                     continue;
                                 }
                             };
@@ -423,12 +523,14 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                 Ok(packet) => packet,
                                 Err(err) => {
                                     let _ = event_tx.send(ClientEvent::Error(format!("Failed to build SUBSCRIBE: {err}")));
+                                    let _ = endpoint.release_packet_id(packet_id).await;
                                     continue;
                                 }
                             };
 
                             if let Err(err) = endpoint.send(subscribe_packet).await {
                                 let _ = event_tx.send(ClientEvent::Error(format!("Failed to send SUBSCRIBE: {err}")));
+                                let _ = endpoint.release_packet_id(packet_id).await;
                                 continue;
                             }
 
@@ -451,12 +553,14 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                 Ok(packet) => packet,
                                 Err(err) => {
                                     let _ = event_tx.send(ClientEvent::Error(format!("Failed to build UNSUBSCRIBE: {err}")));
+                                    let _ = endpoint.release_packet_id(packet_id).await;
                                     continue;
                                 }
                             };
 
                             if let Err(err) = endpoint.send(unsubscribe_packet).await {
                                 let _ = event_tx.send(ClientEvent::Error(format!("Failed to send UNSUBSCRIBE: {err}")));
+                                let _ = endpoint.release_packet_id(packet_id).await;
                                 continue;
                             }
 
@@ -506,17 +610,32 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                 Ok(packet) => packet,
                                 Err(err) => {
                                     let _ = event_tx.send(ClientEvent::Error(format!("Failed to build PUBLISH: {err}")));
+                                    if let Some(id) = packet_id {
+                                        let _ = endpoint.release_packet_id(id).await;
+                                    }
                                     continue;
                                 }
                             };
 
                             if let Err(err) = endpoint.send(publish_packet).await {
                                 let _ = event_tx.send(ClientEvent::Error(format!("Failed to send PUBLISH: {err}")));
+                                if let Some(id) = packet_id {
+                                    let _ = endpoint.release_packet_id(id).await;
+                                }
                                 continue;
                             }
 
                             if let Some(id) = packet_id {
-                                pending_publish.insert(id, (topic.clone(), qos_level == mqtt_ep::packet::Qos::ExactlyOnce));
+                                let state = if qos_level == mqtt_ep::packet::Qos::ExactlyOnce {
+                                    OutgoingPublishState::Pubrec {
+                                        topic: topic.clone(),
+                                    }
+                                } else {
+                                    OutgoingPublishState::Puback {
+                                        topic: topic.clone(),
+                                    }
+                                };
+                                pending_publish.insert(id, state);
                             } else {
                                 let _ = event_tx.send(ClientEvent::Published { topic, packet_id: None });
                             }
@@ -539,18 +658,25 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                             let topic = publish.topic_name().to_string();
                             let qos_level = publish.qos();
                             let retain = publish.retain();
-
-                            let _ = event_tx.send(ClientEvent::MessageReceived {
-                                topic: topic.clone(),
-                                qos: qos_to_u8(qos_level),
-                                retain,
-                                payload,
-                            });
+                            let duplicate = publish.dup();
 
                             match qos_level {
-                                mqtt_ep::packet::Qos::AtMostOnce => {}
+                                mqtt_ep::packet::Qos::AtMostOnce => {
+                                    let _ = event_tx.send(ClientEvent::MessageReceived {
+                                        topic,
+                                        qos: qos_to_u8(qos_level),
+                                        retain,
+                                        payload,
+                                    });
+                                }
                                 mqtt_ep::packet::Qos::AtLeastOnce => {
                                     if let Some(packet_id) = publish.packet_id() {
+                                        let _ = event_tx.send(ClientEvent::MessageReceived {
+                                            topic,
+                                            qos: qos_to_u8(qos_level),
+                                            retain,
+                                            payload,
+                                        });
                                         let puback = match mqtt_ep::packet::v5_0::Puback::builder()
                                             .packet_id(packet_id)
                                             .build()
@@ -565,10 +691,27 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                         if let Err(err) = endpoint.send(puback).await {
                                             let _ = event_tx.send(ClientEvent::Error(format!("Failed to send PUBACK: {err}")));
                                         }
+                                    } else {
+                                        let _ = event_tx.send(ClientEvent::Error(
+                                            "Received QoS 1 PUBLISH without a packet id".to_string(),
+                                        ));
                                     }
                                 }
                                 mqtt_ep::packet::Qos::ExactlyOnce => {
                                     if let Some(packet_id) = publish.packet_id() {
+                                        if !duplicate {
+                                            completed_incoming_qos2.remove(&packet_id);
+                                        }
+                                        if !completed_incoming_qos2.contains(&packet_id) {
+                                            incoming_qos2.entry(packet_id).or_insert(
+                                                IncomingQos2Message {
+                                                    topic,
+                                                    qos: qos_to_u8(qos_level),
+                                                    retain,
+                                                    payload,
+                                                },
+                                            );
+                                        }
                                         let pubrec = match mqtt_ep::packet::v5_0::Pubrec::builder()
                                             .packet_id(packet_id)
                                             .build()
@@ -583,6 +726,10 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                         if let Err(err) = endpoint.send(pubrec).await {
                                             let _ = event_tx.send(ClientEvent::Error(format!("Failed to send PUBREC: {err}")));
                                         }
+                                    } else {
+                                        let _ = event_tx.send(ClientEvent::Error(
+                                            "Received QoS 2 PUBLISH without a packet id".to_string(),
+                                        ));
                                     }
                                 }
                             }
@@ -590,44 +737,102 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         mqtt_ep::packet::Packet::V5_0Suback(suback) => {
                             let packet_id = suback.packet_id();
                             if let Some((topic, qos)) = pending_subscribe.remove(&packet_id) {
-                                let _ = event_tx.send(ClientEvent::Subscribed {
-                                    topic,
-                                    qos,
-                                    details: format!("{:?}", suback.reason_codes()),
-                                });
+                                let codes = suback.reason_codes();
+                                match suback_result(&codes) {
+                                    Ok((granted_qos, details)) => {
+                                        let _ = event_tx.send(ClientEvent::Subscribed {
+                                            topic,
+                                            qos: granted_qos,
+                                            details,
+                                        });
+                                    }
+                                    Err(reason) => {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "SUBACK rejected subscription to '{topic}' (packet id {packet_id}, requested QoS {qos}): {reason}"
+                                        )));
+                                    }
+                                }
+                                let _ = endpoint.release_packet_id(packet_id).await;
                             } else {
-                                let _ = event_tx.send(ClientEvent::Status(format!(
-                                    "SUBACK for unknown packet id {packet_id}"
+                                let _ = event_tx.send(ClientEvent::Error(format!(
+                                    "Unexpected SUBACK for unknown packet id {packet_id}"
                                 )));
                             }
                         }
                         mqtt_ep::packet::Packet::V5_0Unsuback(unsuback) => {
                             let packet_id = unsuback.packet_id();
                             if let Some(topic) = pending_unsubscribe.remove(&packet_id) {
-                                let _ = event_tx.send(ClientEvent::Unsubscribed {
-                                    topic,
-                                    details: format!("{:?}", unsuback.reason_codes()),
-                                });
+                                let codes = unsuback.reason_codes();
+                                match unsuback_result(&codes) {
+                                    Ok(details) => {
+                                        let _ = event_tx.send(ClientEvent::Unsubscribed {
+                                            topic,
+                                            details,
+                                        });
+                                    }
+                                    Err(reason) => {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "UNSUBACK rejected unsubscribe from '{topic}' (packet id {packet_id}): {reason}"
+                                        )));
+                                    }
+                                }
+                                let _ = endpoint.release_packet_id(packet_id).await;
                             } else {
-                                let _ = event_tx.send(ClientEvent::Status(format!(
-                                    "UNSUBACK for unknown packet id {packet_id}"
+                                let _ = event_tx.send(ClientEvent::Error(format!(
+                                    "Unexpected UNSUBACK for unknown packet id {packet_id}"
                                 )));
                             }
                         }
                         mqtt_ep::packet::Packet::V5_0Puback(puback) => {
                             let packet_id = puback.packet_id();
-                            if let Some((topic, _)) = pending_publish.remove(&packet_id) {
-                                let _ = event_tx.send(ClientEvent::Published {
-                                    topic,
-                                    packet_id: Some(packet_id),
-                                });
+                            match pending_publish
+                                .remove(&packet_id)
+                                .map(OutgoingPublishState::complete_with_puback)
+                            {
+                                Some(Ok(topic)) => {
+                                    let reason = puback.reason_code();
+                                    if optional_reason_is_success(reason, |code| code.is_success()) {
+                                        let _ = event_tx.send(ClientEvent::Published {
+                                            topic,
+                                            packet_id: Some(packet_id),
+                                        });
+                                    } else {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "PUBACK rejected publish to '{topic}' (packet id {packet_id}): {}",
+                                            reason.expect("failure reason exists")
+                                        )));
+                                    }
+                                    let _ = endpoint.release_packet_id(packet_id).await;
+                                }
+                                Some(Err(state)) => {
+                                    pending_publish.insert(packet_id, state);
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "Unexpected PUBACK for packet id {packet_id}: publish is not awaiting PUBACK"
+                                    )));
+                                }
+                                None => {
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "Unexpected PUBACK for unknown packet id {packet_id}"
+                                    )));
+                                }
                             }
                         }
                         mqtt_ep::packet::Packet::V5_0Pubrec(pubrec) => {
                             let packet_id = pubrec.packet_id();
-                            if let Some((_, waiting_for_pubcomp)) = pending_publish.get_mut(&packet_id)
-                                && *waiting_for_pubcomp
+                            let reason = pubrec.reason_code();
+                            let transition = pending_publish
+                                .remove(&packet_id)
+                                .map(OutgoingPublishState::after_successful_pubrec);
+                            if let Some(Ok(OutgoingPublishState::Pubcomp { topic })) = transition
                             {
+                                if !optional_reason_is_success(reason, |code| code.is_success()) {
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "PUBREC rejected publish to '{topic}' (packet id {packet_id}): {}",
+                                        reason.expect("failure reason exists")
+                                    )));
+                                    let _ = endpoint.release_packet_id(packet_id).await;
+                                    continue;
+                                }
                                 let pubrel = match mqtt_ep::packet::v5_0::Pubrel::builder()
                                     .packet_id(packet_id)
                                     .build()
@@ -635,22 +840,136 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                     Ok(packet) => packet,
                                     Err(err) => {
                                         let _ = event_tx.send(ClientEvent::Error(format!("Failed to build PUBREL: {err}")));
+                                        let _ = endpoint.release_packet_id(packet_id).await;
                                         continue;
                                     }
                                 };
 
                                 if let Err(err) = endpoint.send(pubrel).await {
                                     let _ = event_tx.send(ClientEvent::Error(format!("Failed to send PUBREL: {err}")));
+                                    let _ = endpoint.release_packet_id(packet_id).await;
+                                } else {
+                                    pending_publish.insert(
+                                        packet_id,
+                                        OutgoingPublishState::Pubcomp { topic },
+                                    );
                                 }
+                            } else if let Some(Err(state @ OutgoingPublishState::Pubcomp { .. })) =
+                                transition
+                            {
+                                pending_publish.insert(packet_id, state);
+                                let pubrel = mqtt_ep::packet::v5_0::Pubrel::builder()
+                                    .packet_id(packet_id)
+                                    .build();
+                                match pubrel {
+                                    Ok(packet) => {
+                                        if let Err(err) = endpoint.send(packet).await {
+                                            let _ = event_tx.send(ClientEvent::Error(format!(
+                                                "Failed to resend PUBREL for duplicate PUBREC (packet id {packet_id}): {err}"
+                                            )));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "Failed to rebuild PUBREL for duplicate PUBREC (packet id {packet_id}): {err}"
+                                        )));
+                                    }
+                                }
+                            } else {
+                                let context = match transition {
+                                    Some(Err(state)) => {
+                                        pending_publish.insert(packet_id, state);
+                                        "publish is not awaiting PUBREC"
+                                    }
+                                    _ => "unknown packet id",
+                                };
+                                let _ = event_tx.send(ClientEvent::Error(format!(
+                                    "Unexpected PUBREC for packet id {packet_id}: {context}"
+                                )));
                             }
                         }
                         mqtt_ep::packet::Packet::V5_0Pubcomp(pubcomp) => {
                             let packet_id = pubcomp.packet_id();
-                            if let Some((topic, _)) = pending_publish.remove(&packet_id) {
-                                let _ = event_tx.send(ClientEvent::Published {
-                                    topic,
-                                    packet_id: Some(packet_id),
+                            match pending_publish
+                                .remove(&packet_id)
+                                .map(OutgoingPublishState::complete_with_pubcomp)
+                            {
+                                Some(Ok(topic)) => {
+                                    let reason = pubcomp.reason_code();
+                                    if optional_reason_is_success(reason, |code| code.is_success()) {
+                                        let _ = event_tx.send(ClientEvent::Published {
+                                            topic,
+                                            packet_id: Some(packet_id),
+                                        });
+                                    } else {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "PUBCOMP rejected publish to '{topic}' (packet id {packet_id}): {}",
+                                            reason.expect("failure reason exists")
+                                        )));
+                                    }
+                                    let _ = endpoint.release_packet_id(packet_id).await;
+                                }
+                                Some(Err(state)) => {
+                                    pending_publish.insert(packet_id, state);
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "Unexpected PUBCOMP for packet id {packet_id}: publish is not awaiting PUBCOMP"
+                                    )));
+                                }
+                                None => {
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "Unexpected PUBCOMP for unknown packet id {packet_id}"
+                                    )));
+                                }
+                            }
+                        }
+                        mqtt_ep::packet::Packet::V5_0Pubrel(pubrel) => {
+                            let packet_id = pubrel.packet_id();
+                            let reason = pubrel.reason_code();
+                            if !optional_reason_is_success(reason, |code| code.is_success()) {
+                                let _ = event_tx.send(ClientEvent::Error(format!(
+                                    "Broker sent failed PUBREL for packet id {packet_id}: {}",
+                                    reason.expect("failure reason exists")
+                                )));
+                            }
+
+                            let message = incoming_qos2.remove(&packet_id);
+                            let already_completed = completed_incoming_qos2.contains(&packet_id);
+                            let mut builder = mqtt_ep::packet::v5_0::Pubcomp::builder()
+                                .packet_id(packet_id);
+                            if message.is_none() && !already_completed {
+                                builder = builder.reason_code(
+                                    mqtt_ep::result_code::PubcompReasonCode::PacketIdentifierNotFound,
+                                );
+                            }
+                            match builder.build() {
+                                Ok(pubcomp) => {
+                                    if let Err(err) = endpoint.send(pubcomp).await {
+                                        let _ = event_tx.send(ClientEvent::Error(format!(
+                                            "Failed to send PUBCOMP for packet id {packet_id}: {err}"
+                                        )));
+                                        continue;
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = event_tx.send(ClientEvent::Error(format!(
+                                        "Failed to build PUBCOMP for packet id {packet_id}: {err}"
+                                    )));
+                                    continue;
+                                }
+                            }
+
+                            if let Some(message) = message {
+                                completed_incoming_qos2.insert(packet_id);
+                                let _ = event_tx.send(ClientEvent::MessageReceived {
+                                    topic: message.topic,
+                                    qos: message.qos,
+                                    retain: message.retain,
+                                    payload: message.payload,
                                 });
+                            } else if !already_completed {
+                                let _ = event_tx.send(ClientEvent::Error(format!(
+                                    "Unexpected PUBREL for unknown incoming QoS 2 packet id {packet_id}"
+                                )));
                             }
                         }
                         mqtt_ep::packet::Packet::V5_0Disconnect(disconnect) => {
@@ -678,5 +997,98 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
         join_handle,
         event_rx,
         command_tx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mqtt_ep::result_code::{ConnectReasonCode, SubackReasonCode, UnsubackReasonCode};
+
+    #[test]
+    fn connack_only_accepts_success_and_explains_authentication_failures() {
+        assert_eq!(connack_error(ConnectReasonCode::Success), None);
+        assert!(
+            connack_error(ConnectReasonCode::BadUserNameOrPassword)
+                .unwrap()
+                .contains("username or password")
+        );
+        assert!(
+            connack_error(ConnectReasonCode::NotAuthorized)
+                .unwrap()
+                .contains("authorization")
+        );
+        assert!(
+            connack_error(ConnectReasonCode::ServerBusy)
+                .unwrap()
+                .contains("ServerBusy")
+        );
+    }
+
+    #[test]
+    fn suback_uses_granted_qos_and_rejects_failures_or_wrong_cardinality() {
+        assert_eq!(
+            suback_result(&[SubackReasonCode::GrantedQos1]),
+            Ok((1, "GrantedQos1".to_string()))
+        );
+        assert_eq!(
+            suback_result(&[SubackReasonCode::NotAuthorized]),
+            Err("NotAuthorized".to_string())
+        );
+        assert!(suback_result(&[]).unwrap_err().contains("exactly one"));
+        assert!(
+            suback_result(&[SubackReasonCode::GrantedQos0, SubackReasonCode::GrantedQos1])
+                .unwrap_err()
+                .contains("received 2")
+        );
+    }
+
+    #[test]
+    fn unsuback_treats_no_existing_subscription_as_success() {
+        assert_eq!(
+            unsuback_result(&[UnsubackReasonCode::NoSubscriptionExisted]),
+            Ok("NoSubscriptionExisted".to_string())
+        );
+        assert_eq!(
+            unsuback_result(&[UnsubackReasonCode::NotAuthorized]),
+            Err("NotAuthorized".to_string())
+        );
+    }
+
+    #[test]
+    fn outgoing_qos_states_only_accept_the_expected_acknowledgements() {
+        let qos1 = OutgoingPublishState::Puback {
+            topic: "qos1".to_string(),
+        };
+        assert_eq!(qos1.complete_with_puback(), Ok("qos1".to_string()));
+
+        let qos2 = OutgoingPublishState::Pubrec {
+            topic: "qos2".to_string(),
+        };
+        let qos2 = qos2.after_successful_pubrec().unwrap();
+        assert_eq!(
+            qos2,
+            OutgoingPublishState::Pubcomp {
+                topic: "qos2".to_string()
+            }
+        );
+        assert_eq!(qos2.complete_with_pubcomp(), Ok("qos2".to_string()));
+
+        let wrong = OutgoingPublishState::Pubrec {
+            topic: "wrong".to_string(),
+        };
+        assert!(wrong.complete_with_puback().is_err());
+    }
+
+    #[test]
+    fn omitted_publish_ack_reason_code_means_success() {
+        assert!(optional_reason_is_success(
+            None::<mqtt_ep::result_code::PubackReasonCode>,
+            |code| code.is_success()
+        ));
+        assert!(!optional_reason_is_success(
+            Some(mqtt_ep::result_code::PubackReasonCode::NotAuthorized),
+            |code| code.is_success()
+        ));
     }
 }
