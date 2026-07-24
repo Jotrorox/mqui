@@ -1,10 +1,9 @@
 use mqtt_endpoint_tokio::mqtt_ep;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::mpsc;
 use std::sync::{Arc, Once};
 use tokio::runtime::Runtime;
@@ -102,11 +101,10 @@ fn build_tls_config(
                 let _ = root_store.add(cert);
             }
 
-            let file = File::open(path)
+            let certs = CertificateDer::pem_file_iter(path)
                 .map_err(|err| format!("Failed to open CA PEM file '{path}': {err}"))?;
-            let mut reader = BufReader::new(file);
             let mut found_cert = false;
-            for cert in rustls_pemfile::certs(&mut reader) {
+            for cert in certs {
                 let cert =
                     cert.map_err(|err| format!("Failed to read CA PEM file '{path}': {err}"))?;
                 root_store.add(cert).map_err(|err| {
