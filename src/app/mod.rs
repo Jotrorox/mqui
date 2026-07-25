@@ -24,8 +24,12 @@ pub struct App {
     pub(crate) dragging_tab: Option<u64>,
     pub(crate) mqtt_form: MqttLoginData,
     pub(crate) profile_entries: Vec<ProfileEntry>,
-    pub(crate) selected_profile_name: Option<String>,
+    pub(crate) selected_profile_id: Option<String>,
     pub(crate) profile_status: Option<String>,
+    pub(crate) confirm_profile_overwrite: bool,
+    pub(crate) profile_rename_open: bool,
+    pub(crate) profile_rename_buffer: String,
+    pub(crate) confirm_profile_delete: bool,
     pub(crate) runtime: Runtime,
     pub(crate) clients: HashMap<u64, ClientHandle>,
     pub(crate) repaint_context: egui::Context,
@@ -52,8 +56,12 @@ impl Default for App {
             dragging_tab: None,
             mqtt_form: MqttLoginData::default(),
             profile_entries: Vec::new(),
-            selected_profile_name: None,
+            selected_profile_id: None,
             profile_status: None,
+            confirm_profile_overwrite: false,
+            profile_rename_open: false,
+            profile_rename_buffer: String::new(),
+            confirm_profile_delete: false,
             runtime,
             clients: HashMap::new(),
             repaint_context: egui::Context::default(),
@@ -304,25 +312,35 @@ impl App {
         match config_profiles::list_profiles() {
             Ok(entries) => {
                 self.profile_entries = entries;
-                if let Some(selected) = &self.selected_profile_name {
+                if let Some(selected) = &self.selected_profile_id {
                     let exists = self
                         .profile_entries
                         .iter()
-                        .any(|entry| &entry.display_name == selected);
+                        .any(|entry| &entry.id == selected);
                     if !exists {
-                        self.selected_profile_name = None;
+                        self.selected_profile_id = None;
                     }
+                }
+                let warning_count = self
+                    .profile_entries
+                    .iter()
+                    .filter(|entry| entry.warning.is_some())
+                    .count();
+                if warning_count > 0 {
+                    self.profile_status = Some(format!(
+                        "{warning_count} profile file(s) need attention; see the profile list"
+                    ));
                 }
             }
             Err(err) => {
                 self.profile_entries.clear();
-                self.selected_profile_name = None;
+                self.selected_profile_id = None;
                 self.profile_status = Some(err);
             }
         }
     }
 
-    pub(crate) fn save_current_profile(&mut self) {
+    pub(crate) fn save_current_profile(&mut self, overwrite: bool) {
         let profile_name = self.mqtt_form.name.trim();
         if profile_name.is_empty() {
             self.profile_status = Some("Name is required to save configuration".to_string());
@@ -333,10 +351,22 @@ impl App {
             return;
         }
 
-        match config_profiles::save_profile(profile_name, &self.mqtt_form) {
-            Ok(()) => {
-                self.selected_profile_name = Some(profile_name.to_string());
+        let result = if overwrite {
+            self.selected_profile_id
+                .as_deref()
+                .ok_or_else(|| "No profile is selected for overwrite".to_string())
+                .and_then(|id| {
+                    config_profiles::overwrite_profile(id, profile_name, &self.mqtt_form)
+                })
+                .map(|()| self.selected_profile_id.clone().unwrap_or_default())
+        } else {
+            config_profiles::create_profile(profile_name, &self.mqtt_form)
+        };
+        match result {
+            Ok(id) => {
+                self.selected_profile_id = Some(id);
                 self.profile_status = Some(format!("Saved profile '{profile_name}'"));
+                self.confirm_profile_overwrite = false;
                 self.refresh_profiles();
             }
             Err(err) => {
@@ -345,21 +375,22 @@ impl App {
         }
     }
 
-    pub(crate) fn load_profile_into_form(&mut self, profile_name: &str) {
+    pub(crate) fn load_profile_into_form(&mut self, profile_id: &str) {
         let Some(entry) = self
             .profile_entries
             .iter()
-            .find(|entry| entry.display_name == profile_name)
+            .find(|entry| entry.id == profile_id)
+            .cloned()
         else {
-            self.profile_status = Some(format!("Profile '{profile_name}' not found"));
+            self.profile_status = Some("Profile not found".to_string());
             return;
         };
 
         match config_profiles::load_profile_file(&entry.file_path) {
             Ok(login) => {
                 self.mqtt_form = login;
-                self.selected_profile_name = Some(profile_name.to_string());
-                self.profile_status = Some(format!("Loaded profile '{profile_name}'"));
+                self.selected_profile_id = Some(profile_id.to_string());
+                self.profile_status = Some(format!("Loaded profile '{}'", entry.display_name));
             }
             Err(err) => {
                 self.profile_status = Some(err);
@@ -379,12 +410,64 @@ impl App {
         match config_profiles::load_template_file(&path) {
             Ok(login) => {
                 self.mqtt_form = login;
-                self.selected_profile_name = None;
+                self.selected_profile_id = None;
                 self.profile_status = Some(format!("Loaded template {}", path.display()));
             }
             Err(err) => {
                 self.profile_status = Some(err);
             }
+        }
+    }
+
+    pub(crate) fn rename_selected_profile(&mut self) {
+        let Some(id) = self.selected_profile_id.as_deref() else {
+            self.profile_status = Some("No profile selected".into());
+            return;
+        };
+        match config_profiles::rename_profile(id, &self.profile_rename_buffer) {
+            Ok(()) => {
+                self.profile_status = Some(format!(
+                    "Renamed profile to '{}'",
+                    self.profile_rename_buffer.trim()
+                ));
+                self.profile_rename_open = false;
+                self.refresh_profiles();
+            }
+            Err(err) => self.profile_status = Some(err),
+        }
+    }
+
+    pub(crate) fn delete_selected_profile(&mut self) {
+        let Some(id) = self.selected_profile_id.clone() else {
+            self.profile_status = Some("No profile selected".into());
+            return;
+        };
+        match config_profiles::delete_profile(&id) {
+            Ok(()) => {
+                self.selected_profile_id = None;
+                self.confirm_profile_delete = false;
+                self.profile_status = Some("Deleted profile".into());
+                self.refresh_profiles();
+            }
+            Err(err) => self.profile_status = Some(err),
+        }
+    }
+
+    pub(crate) fn export_selected_profile(&mut self) {
+        let Some(id) = self.selected_profile_id.clone() else {
+            self.profile_status = Some("No profile selected".into());
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("TOML", &["toml"])
+            .set_file_name("profile.toml")
+            .save_file()
+        else {
+            return;
+        };
+        match config_profiles::export_profile(&id, &path) {
+            Ok(()) => self.profile_status = Some(format!("Exported profile to {}", path.display())),
+            Err(err) => self.profile_status = Some(err),
         }
     }
 

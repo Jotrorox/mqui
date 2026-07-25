@@ -295,8 +295,12 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         let mut open = app.show_mqtt_popup;
         let mut create_client = false;
         let mut save_profile = false;
+        let mut request_overwrite = false;
         let mut profile_to_load: Option<String> = None;
         let mut load_template = false;
+        let mut rename_profile = false;
+        let mut delete_profile = false;
+        let mut export_profile = false;
 
         egui::Window::new("MQTT Login")
             .collapsible(false)
@@ -500,12 +504,22 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let selected_profile_text = app
-                            .selected_profile_name
-                            .as_deref()
-                            .unwrap_or("Load configuration");
+                            .selected_profile_id
+                            .as_ref()
+                            .and_then(|id| app.profile_entries.iter().find(|entry| &entry.id == id))
+                            .map_or("Load configuration", |entry| entry.display_name.as_str());
 
-                        if ui.button("Save template").clicked() {
+                        if ui.button("Save as new").clicked() {
                             save_profile = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                app.selected_profile_id.is_some(),
+                                egui::Button::new("Overwrite"),
+                            )
+                            .clicked()
+                        {
+                            request_overwrite = true;
                         }
 
                         egui::ComboBox::from_id_salt("mqtt_config_picker")
@@ -513,12 +527,20 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             .show_ui(ui, |ui| {
                                 for entry in &app.profile_entries {
                                     let selected = app
-                                        .selected_profile_name
+                                        .selected_profile_id
                                         .as_ref()
-                                        .is_some_and(|current| current == &entry.display_name);
-                                    if ui.selectable_label(selected, &entry.display_name).clicked()
-                                    {
-                                        profile_to_load = Some(entry.display_name.clone());
+                                        .is_some_and(|current| current == &entry.id);
+                                    let label = if entry.warning.is_some() {
+                                        format!("⚠ {}", entry.display_name)
+                                    } else {
+                                        entry.display_name.clone()
+                                    };
+                                    let response = ui.selectable_label(selected, label);
+                                    if let Some(warning) = &entry.warning {
+                                        response.clone().on_hover_text(warning);
+                                    }
+                                    if response.clicked() {
+                                        profile_to_load = Some(entry.id.clone());
                                         ui.close();
                                     }
                                 }
@@ -533,6 +555,31 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                 }
                             });
 
+                        ui.menu_button("Profile actions", |ui| {
+                            let selected = app.selected_profile_id.is_some();
+                            if ui
+                                .add_enabled(selected, egui::Button::new("Rename..."))
+                                .clicked()
+                            {
+                                rename_profile = true;
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(selected, egui::Button::new("Delete..."))
+                                .clicked()
+                            {
+                                delete_profile = true;
+                                ui.close();
+                            }
+                            if ui
+                                .add_enabled(selected, egui::Button::new("Export..."))
+                                .clicked()
+                            {
+                                export_profile = true;
+                                ui.close();
+                            }
+                        });
+
                         if ui.button("Add client").clicked() {
                             create_client = true;
                         }
@@ -541,15 +588,99 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             });
 
         if save_profile {
-            app.save_current_profile();
+            app.save_current_profile(false);
+        }
+        if request_overwrite {
+            app.confirm_profile_overwrite = true;
         }
 
-        if let Some(profile_name) = profile_to_load {
-            app.load_profile_into_form(&profile_name);
+        if let Some(profile_id) = profile_to_load {
+            app.load_profile_into_form(&profile_id);
         }
 
         if load_template {
             app.load_template_from_file_picker();
+        }
+        if rename_profile
+            && let Some(entry) = app
+                .selected_profile_id
+                .as_ref()
+                .and_then(|id| app.profile_entries.iter().find(|entry| &entry.id == id))
+        {
+            app.profile_rename_buffer.clone_from(&entry.display_name);
+            app.profile_rename_open = true;
+        }
+        if delete_profile {
+            app.confirm_profile_delete = true;
+        }
+        if export_profile {
+            app.export_selected_profile();
+        }
+
+        if app.confirm_profile_overwrite {
+            let mut visible = true;
+            egui::Window::new("Overwrite profile?")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut visible)
+                .show(&ctx, |ui| {
+                    ui.label("Replace the selected profile with the current form values?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            app.confirm_profile_overwrite = false;
+                        }
+                        if ui.button("Overwrite").clicked() {
+                            app.save_current_profile(true);
+                        }
+                    });
+                });
+            if !visible {
+                app.confirm_profile_overwrite = false;
+            }
+        }
+
+        if app.profile_rename_open {
+            let mut visible = true;
+            egui::Window::new("Rename profile")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut visible)
+                .show(&ctx, |ui| {
+                    ui.text_edit_singleline(&mut app.profile_rename_buffer);
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            app.profile_rename_open = false;
+                        }
+                        if ui.button("Rename").clicked() {
+                            app.rename_selected_profile();
+                        }
+                    });
+                });
+            if !visible {
+                app.profile_rename_open = false;
+            }
+        }
+
+        if app.confirm_profile_delete {
+            let mut visible = true;
+            egui::Window::new("Delete profile?")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut visible)
+                .show(&ctx, |ui| {
+                    ui.label("This permanently deletes the selected profile.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            app.confirm_profile_delete = false;
+                        }
+                        if ui.button("Delete").clicked() {
+                            app.delete_selected_profile();
+                        }
+                    });
+                });
+            if !visible {
+                app.confirm_profile_delete = false;
+            }
         }
 
         if create_client {
