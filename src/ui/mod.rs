@@ -445,6 +445,21 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                         .range(1..=u16::MAX),
                                 );
                             });
+                            ui.checkbox(
+                                &mut app.mqtt_form.automatic_reconnect,
+                                "Automatically reconnect",
+                            );
+                            if app.mqtt_form.automatic_reconnect {
+                                ui.horizontal(|ui| {
+                                    ui.label("Maximum reconnect delay (seconds)");
+                                    ui.add(
+                                        egui::DragValue::new(
+                                            &mut app.mqtt_form.reconnect_max_delay_secs,
+                                        )
+                                        .range(1..=u16::MAX),
+                                    );
+                                });
+                            }
 
                             ui.label("Client ID (optional)");
                             ui.text_edit_singleline(&mut app.mqtt_form.client_id);

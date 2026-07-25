@@ -48,6 +48,10 @@ struct LoginTemplateFile {
     tls_verification: TlsVerificationMode,
     #[serde(default)]
     tls_ca_cert_path: String,
+    #[serde(default = "default_true")]
+    automatic_reconnect: bool,
+    #[serde(default = "default_reconnect_max_delay")]
+    reconnect_max_delay_secs: u16,
 }
 
 impl LoginTemplateFile {
@@ -70,6 +74,8 @@ impl LoginTemplateFile {
             ws_path: login.ws_path.clone(),
             tls_verification: login.tls_verification,
             tls_ca_cert_path: login.tls_ca_cert_path.clone(),
+            automatic_reconnect: login.automatic_reconnect,
+            reconnect_max_delay_secs: login.reconnect_max_delay_secs,
         }
     }
 
@@ -92,8 +98,18 @@ impl LoginTemplateFile {
             ws_path: self.ws_path,
             tls_verification: self.tls_verification,
             tls_ca_cert_path: self.tls_ca_cert_path,
+            automatic_reconnect: self.automatic_reconnect,
+            reconnect_max_delay_secs: self.reconnect_max_delay_secs.max(1),
         }
     }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_reconnect_max_delay() -> u16 {
+    30
 }
 
 pub(crate) fn list_profiles() -> Result<Vec<ProfileEntry>, String> {
@@ -250,6 +266,8 @@ keep_alive_secs = 30
             ws_path: "/mqtt".to_string(),
             tls_verification: TlsVerificationMode::CustomCa,
             tls_ca_cert_path: "/tmp/ca.pem".to_string(),
+            automatic_reconnect: true,
+            reconnect_max_delay_secs: 30,
         };
 
         let serialized = toml::to_string_pretty(&template).unwrap();
@@ -289,6 +307,8 @@ keep_alive_secs = 30
             ws_path: "/mqtt".to_string(),
             tls_verification: TlsVerificationMode::InsecureSkipVerify,
             tls_ca_cert_path: String::new(),
+            automatic_reconnect: true,
+            reconnect_max_delay_secs: 30,
         };
 
         let serialized = toml::to_string_pretty(&template).unwrap();

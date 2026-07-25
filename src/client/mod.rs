@@ -6,18 +6,56 @@ use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::{Arc, Once};
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::timeout;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::http::Request;
+use tokio_util::sync::CancellationToken;
 
 use crate::models::client::ClientHandle;
-use crate::models::ipc::{ClientCommand, ClientEvent};
+use crate::models::ipc::{ClientCommand, ClientEvent, ConnectionState};
 use crate::models::mqtt::{MqttLoginData, TlsVerificationMode, TransportKind};
 use crate::utils::qos::qos_to_u8;
 
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
+const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(10);
+const MQTT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const ACK_TIMEOUT: Duration = Duration::from_secs(15);
+const COMMAND_CAPACITY: usize = 256;
+const EVENT_CAPACITY: usize = 2_048;
+const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct EventSender {
+    sender: mpsc::SyncSender<ClientEvent>,
+    ctx: egui::Context,
+}
+
+impl EventSender {
+    fn send(&self, event: ClientEvent) -> Result<(), ()> {
+        self.sender.try_send(event).map_err(|_| ())?;
+        self.ctx.request_repaint();
+        Ok(())
+    }
+
+    fn try_send(&self, event: ClientEvent) -> Result<(), ()> {
+        self.send(event)
+    }
+}
+
+pub(crate) fn reconnect_delay(attempt: u32, maximum: Duration) -> Duration {
+    let multiplier = 1_u32.checked_shl(attempt.min(30)).unwrap_or(u32::MAX);
+    INITIAL_RECONNECT_DELAY
+        .saturating_mul(multiplier)
+        .min(maximum)
+}
+
+fn emit(event_tx: &EventSender, event: ClientEvent) {
+    let _ = event_tx.try_send(event);
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum OutgoingPublishState {
@@ -239,80 +277,100 @@ fn build_websocket_request(addr: &str, path: &str) -> Result<Request<()>, String
 
 async fn connect_transport(
     login: &MqttLoginData,
+    cancellation: &CancellationToken,
 ) -> Result<(Box<dyn mqtt_ep::transport::TransportOps + Send>, String), String> {
     let resolved = login.resolve_connection()?;
-    let transport: Box<dyn mqtt_ep::transport::TransportOps + Send> = match resolved.transport {
-        TransportKind::Tcp => {
-            let stream = mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+    let operation = async {
+        let transport: Box<dyn mqtt_ep::transport::TransportOps + Send> = match resolved.transport {
+            TransportKind::Tcp => {
+                let stream = mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+                    .await
+                    .map_err(|err| format!("TCP connect failed: {err}"))?;
+                Box::new(mqtt_ep::transport::TcpTransport::from_stream(stream))
+            }
+            TransportKind::Tls => {
+                let domain = resolved
+                    .tls_domain
+                    .as_deref()
+                    .ok_or_else(|| "TLS transport requires a server name".to_string())?;
+                let tls_config = build_tls_config(login, domain)?;
+                let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls(
+                    &resolved.addr,
+                    domain,
+                    tls_config,
+                    None,
+                )
                 .await
-                .map_err(|err| format!("TCP connect failed: {err}"))?;
-            Box::new(mqtt_ep::transport::TcpTransport::from_stream(stream))
-        }
-        TransportKind::Tls => {
-            let domain = resolved
-                .tls_domain
-                .as_deref()
-                .ok_or_else(|| "TLS transport requires a server name".to_string())?;
-            let tls_config = build_tls_config(login, domain)?;
-            let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls(
-                &resolved.addr,
-                domain,
-                tls_config,
-                None,
-            )
-            .await
-            .map_err(|err| format!("TLS connect failed: {err}"))?;
-            Box::new(mqtt_ep::transport::TlsTransport::from_stream(stream))
-        }
-        TransportKind::Ws => {
-            let path = resolved
-                .ws_path
-                .as_deref()
-                .ok_or_else(|| "WebSocket transport requires a path".to_string())?;
-            let tcp_stream = mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+                .map_err(|err| format!("TLS connect failed: {err}"))?;
+                Box::new(mqtt_ep::transport::TlsTransport::from_stream(stream))
+            }
+            TransportKind::Ws => {
+                let path = resolved
+                    .ws_path
+                    .as_deref()
+                    .ok_or_else(|| "WebSocket transport requires a path".to_string())?;
+                let tcp_stream =
+                    mqtt_ep::transport::connect_helper::connect_tcp(&resolved.addr, None)
+                        .await
+                        .map_err(|err| format!("WebSocket TCP connect failed: {err}"))?;
+                let request = build_websocket_request(&resolved.addr, path)?;
+                let (stream, _response) = client_async(request, tcp_stream)
+                    .await
+                    .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+                Box::new(mqtt_ep::transport::WebSocketTransport::from_tcp_client_stream(stream))
+            }
+            TransportKind::Wss => {
+                let domain = resolved.tls_domain.as_deref().ok_or_else(|| {
+                    "Secure WebSocket transport requires a server name".to_string()
+                })?;
+                let path = resolved
+                    .ws_path
+                    .as_deref()
+                    .ok_or_else(|| "Secure WebSocket transport requires a path".to_string())?;
+                let tls_config = build_tls_config(login, domain)?;
+                let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls_ws(
+                    &resolved.addr,
+                    domain,
+                    path,
+                    tls_config,
+                    None,
+                    None,
+                )
                 .await
-                .map_err(|err| format!("WebSocket TCP connect failed: {err}"))?;
-            let request = build_websocket_request(&resolved.addr, path)?;
-            let (stream, _response) = client_async(request, tcp_stream)
-                .await
-                .map_err(|err| format!("WebSocket connect failed: {err}"))?;
-            Box::new(mqtt_ep::transport::WebSocketTransport::from_tcp_client_stream(stream))
-        }
-        TransportKind::Wss => {
-            let domain = resolved
-                .tls_domain
-                .as_deref()
-                .ok_or_else(|| "Secure WebSocket transport requires a server name".to_string())?;
-            let path = resolved
-                .ws_path
-                .as_deref()
-                .ok_or_else(|| "Secure WebSocket transport requires a path".to_string())?;
-            let tls_config = build_tls_config(login, domain)?;
-            let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls_ws(
-                &resolved.addr,
-                domain,
-                path,
-                tls_config,
-                None,
-                None,
-            )
-            .await
-            .map_err(|err| format!("Secure WebSocket connect failed: {err}"))?;
-            Box::new(mqtt_ep::transport::WebSocketTransport::from_tls_client_stream(stream))
-        }
-    };
+                .map_err(|err| format!("Secure WebSocket connect failed: {err}"))?;
+                Box::new(mqtt_ep::transport::WebSocketTransport::from_tls_client_stream(stream))
+            }
+        };
 
-    Ok((transport, resolved.display_label))
+        Ok((transport, resolved.display_label))
+    };
+    tokio::select! {
+        () = cancellation.cancelled() => Err("Connection cancelled".to_string()),
+        result = timeout(TRANSPORT_TIMEOUT, operation) => {
+            result.map_err(|_| format!("{} connection timed out after {}s", resolved.transport.label(), TRANSPORT_TIMEOUT.as_secs()))?
+        }
+    }
 }
 
-pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData) -> ClientHandle {
-    let (event_tx, event_rx) = mpsc::channel();
-    let (command_tx, mut command_rx) = tokio_mpsc::unbounded_channel::<ClientCommand>();
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+pub(crate) fn spawn_client(
+    runtime: &Runtime,
+    tab_id: u64,
+    login: MqttLoginData,
+    ctx: egui::Context,
+) -> ClientHandle {
+    let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+    let event_tx = EventSender {
+        sender: event_tx,
+        ctx,
+    };
+    let (command_tx, mut command_rx) = tokio_mpsc::channel::<ClientCommand>(COMMAND_CAPACITY);
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
     let client_id = login.effective_client_id(tab_id);
     let keep_alive_secs = login.effective_keep_alive_secs();
 
     let join_handle = runtime.spawn(async move {
+        emit(&event_tx, ClientEvent::State(ConnectionState::Connecting));
         let resolved = match login.resolve_connection() {
             Ok(resolved) => resolved,
             Err(err) => {
@@ -329,7 +387,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
         )));
 
         let endpoint = mqtt_ep::endpoint::Endpoint::<mqtt_ep::role::Client>::new(mqtt_ep::Version::V5_0);
-        let (transport, display_label) = match connect_transport(&login).await {
+        let (transport, display_label) = match connect_transport(&login, &task_cancellation).await {
             Ok(transport) => transport,
             Err(err) => {
                 let _ = event_tx.send(ClientEvent::Disconnected(err));
@@ -410,19 +468,36 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
             }
         };
 
-        if let Err(err) = endpoint.send(connect_packet).await {
+        let send_connect = tokio::select! {
+            () = task_cancellation.cancelled() => return,
+            result = timeout(MQTT_HANDSHAKE_TIMEOUT, endpoint.send(connect_packet)) => result,
+        };
+        if let Err(err) = send_connect.map_err(|_| "CONNECT send timed out") {
             let _ = event_tx.send(ClientEvent::Disconnected(format!("CONNECT send failed: {err}")));
             let _ = endpoint.close().await;
             return;
         }
 
-        let connack = match endpoint.recv().await {
+        let connack = match tokio::select! {
+            () = task_cancellation.cancelled() => {
+                let _ = endpoint.close().await;
+                return;
+            }
+            result = timeout(MQTT_HANDSHAKE_TIMEOUT, endpoint.recv()) => result,
+        } {
+            Err(_) => {
+                let _ = event_tx.send(ClientEvent::Disconnected("Waiting for CONNACK timed out".to_string()));
+                let _ = endpoint.close().await;
+                return;
+            }
+            Ok(result) => match result {
             Ok(packet) => packet,
             Err(err) => {
                 let _ = event_tx.send(ClientEvent::Disconnected(format!("CONNACK recv failed: {err}")));
                 let _ = endpoint.close().await;
                 return;
             }
+            },
         };
 
         match connack {
@@ -434,7 +509,8 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                     let _ = endpoint.close().await;
                     return;
                 }
-                let _ = event_tx.send(ClientEvent::Connected);
+                emit(&event_tx, ClientEvent::State(ConnectionState::Connected));
+                let _ = event_tx.try_send(ClientEvent::Connected);
                 let _ =
                     event_tx.send(ClientEvent::Status(format!("Connected to {display_label}")));
             }
@@ -453,10 +529,29 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
         let mut pending_publish: HashMap<u16, OutgoingPublishState> = HashMap::new();
         let mut incoming_qos2: HashMap<u16, IncomingQos2Message> = HashMap::new();
         let mut completed_incoming_qos2: HashSet<u16> = HashSet::new();
+        let mut acknowledgement_deadlines: HashMap<u16, tokio::time::Instant> = HashMap::new();
+        let mut acknowledgement_timer = tokio::time::interval(Duration::from_secs(1));
 
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => {
+                _ = acknowledgement_timer.tick() => {
+                    let now = tokio::time::Instant::now();
+                    let expired: Vec<u16> = acknowledgement_deadlines
+                        .iter()
+                        .filter_map(|(id, deadline)| (*deadline <= now).then_some(*id))
+                        .collect();
+                    for packet_id in expired {
+                        acknowledgement_deadlines.remove(&packet_id);
+                        pending_subscribe.remove(&packet_id);
+                        pending_unsubscribe.remove(&packet_id);
+                        pending_publish.remove(&packet_id);
+                        let _ = endpoint.release_packet_id(packet_id).await;
+                        let _ = event_tx.try_send(ClientEvent::Error(format!(
+                            "Acknowledgement timed out for packet id {packet_id}"
+                        )));
+                    }
+                }
+                () = task_cancellation.cancelled() => {
                     let _ = endpoint.close().await;
                     let _ = event_tx.send(ClientEvent::Status("Closed".to_string()));
                     break;
@@ -478,13 +573,6 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                             let _ = endpoint.close().await;
                             let _ = event_tx.send(ClientEvent::Disconnected(
                                 "Disconnected by user".to_string(),
-                            ));
-                            break;
-                        }
-                        ClientCommand::ForceDisconnect => {
-                            let _ = endpoint.close().await;
-                            let _ = event_tx.send(ClientEvent::Disconnected(
-                                "Force disconnected by user".to_string(),
                             ));
                             break;
                         }
@@ -535,6 +623,10 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                             }
 
                             pending_subscribe.insert(packet_id, (topic, qos));
+                            acknowledgement_deadlines.insert(
+                                packet_id,
+                                tokio::time::Instant::now() + ACK_TIMEOUT,
+                            );
                         }
                         ClientCommand::Unsubscribe { topic } => {
                             let packet_id = match endpoint.acquire_packet_id().await {
@@ -565,6 +657,10 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                             }
 
                             pending_unsubscribe.insert(packet_id, topic);
+                            acknowledgement_deadlines.insert(
+                                packet_id,
+                                tokio::time::Instant::now() + ACK_TIMEOUT,
+                            );
                         }
                         ClientCommand::Publish {
                             topic,
@@ -636,6 +732,10 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                                     }
                                 };
                                 pending_publish.insert(id, state);
+                                acknowledgement_deadlines.insert(
+                                    id,
+                                    tokio::time::Instant::now() + ACK_TIMEOUT,
+                                );
                             } else {
                                 let _ = event_tx.send(ClientEvent::Published { topic, packet_id: None });
                             }
@@ -736,6 +836,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         }
                         mqtt_ep::packet::Packet::V5_0Suback(suback) => {
                             let packet_id = suback.packet_id();
+                            acknowledgement_deadlines.remove(&packet_id);
                             if let Some((topic, qos)) = pending_subscribe.remove(&packet_id) {
                                 let codes = suback.reason_codes();
                                 match suback_result(&codes) {
@@ -761,6 +862,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         }
                         mqtt_ep::packet::Packet::V5_0Unsuback(unsuback) => {
                             let packet_id = unsuback.packet_id();
+                            acknowledgement_deadlines.remove(&packet_id);
                             if let Some(topic) = pending_unsubscribe.remove(&packet_id) {
                                 let codes = unsuback.reason_codes();
                                 match unsuback_result(&codes) {
@@ -785,6 +887,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         }
                         mqtt_ep::packet::Packet::V5_0Puback(puback) => {
                             let packet_id = puback.packet_id();
+                            acknowledgement_deadlines.remove(&packet_id);
                             match pending_publish
                                 .remove(&packet_id)
                                 .map(OutgoingPublishState::complete_with_puback)
@@ -819,6 +922,10 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         }
                         mqtt_ep::packet::Packet::V5_0Pubrec(pubrec) => {
                             let packet_id = pubrec.packet_id();
+                            acknowledgement_deadlines.insert(
+                                packet_id,
+                                tokio::time::Instant::now() + ACK_TIMEOUT,
+                            );
                             let reason = pubrec.reason_code();
                             let transition = pending_publish
                                 .remove(&packet_id)
@@ -890,6 +997,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
                         }
                         mqtt_ep::packet::Packet::V5_0Pubcomp(pubcomp) => {
                             let packet_id = pubcomp.packet_id();
+                            acknowledgement_deadlines.remove(&packet_id);
                             match pending_publish
                                 .remove(&packet_id)
                                 .map(OutgoingPublishState::complete_with_pubcomp)
@@ -993,7 +1101,7 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
     });
 
     ClientHandle {
-        shutdown_tx: Some(shutdown_tx),
+        cancellation,
         join_handle,
         event_rx,
         command_tx,
@@ -1004,6 +1112,16 @@ pub(crate) fn spawn_client(runtime: &Runtime, tab_id: u64, login: MqttLoginData)
 mod tests {
     use super::*;
     use mqtt_ep::result_code::{ConnectReasonCode, SubackReasonCode, UnsubackReasonCode};
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        let maximum = Duration::from_secs(10);
+        assert_eq!(reconnect_delay(0, maximum), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(1, maximum), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(3, maximum), Duration::from_secs(8));
+        assert_eq!(reconnect_delay(4, maximum), maximum);
+        assert_eq!(reconnect_delay(100, maximum), maximum);
+    }
 
     #[test]
     fn connack_only_accepts_success_and_explains_authentication_failures() {

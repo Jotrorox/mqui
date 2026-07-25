@@ -10,7 +10,8 @@ eframe = "0.35.0"
 egui = "0.35.0"
 mqtt-endpoint-tokio = "0.6.5"
 mimalloc = { version = "0.1.52", features = ["secure"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-util = "0.7.16"
 directories = "6"
 rfd = "0.17.2"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }

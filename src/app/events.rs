@@ -23,8 +23,19 @@ pub(crate) fn pump_client_events(app: &mut App) {
 
         loop {
             match client.event_rx.try_recv() {
+                Ok(ClientEvent::State(state)) => {
+                    app.connection_states.insert(tab.id, state);
+                    *connection_status = state.to_string();
+                    if matches!(
+                        state,
+                        crate::models::ipc::ConnectionState::Connected
+                            | crate::models::ipc::ConnectionState::Disconnected
+                    ) {
+                        *last_error = None;
+                    }
+                }
                 Ok(ClientEvent::Status(status)) => {
-                    *connection_status = status;
+                    *last_error = Some(status);
                 }
                 Ok(ClientEvent::Error(err)) => {
                     *last_error = Some(err);
@@ -34,7 +45,9 @@ pub(crate) fn pump_client_events(app: &mut App) {
                     *last_error = None;
                 }
                 Ok(ClientEvent::Disconnected(msg)) => {
-                    *connection_status = "Disconnected".to_string();
+                    app.connection_states
+                        .insert(tab.id, crate::models::ipc::ConnectionState::Failed);
+                    *connection_status = "Failed".to_string();
                     *last_error = Some(msg);
                 }
                 Ok(ClientEvent::Subscribed {
@@ -51,20 +64,18 @@ pub(crate) fn pump_client_events(app: &mut App) {
                             qos,
                         });
                     }
-                    *connection_status = format!("Subscribed to '{topic}'");
                     *last_error = Some(format!("SUBACK: {details}"));
                 }
                 Ok(ClientEvent::Unsubscribed { topic, details }) => {
                     subscriptions.retain(|entry| entry.topic != topic);
-                    *connection_status = format!("Unsubscribed from '{topic}'");
                     *last_error = Some(format!("UNSUBACK: {details}"));
                 }
                 Ok(ClientEvent::Published { topic, packet_id }) => {
                     *published_count += 1;
                     if let Some(id) = packet_id {
-                        *connection_status = format!("Published to '{topic}' (packet id {id})");
+                        *last_error = Some(format!("Published to '{topic}' (packet id {id})"));
                     } else {
-                        *connection_status = format!("Published to '{topic}'");
+                        *last_error = Some(format!("Published to '{topic}'"));
                     }
                 }
                 Ok(ClientEvent::MessageReceived {

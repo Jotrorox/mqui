@@ -119,6 +119,8 @@ pub(crate) struct MqttLoginData {
     pub(crate) ws_path: String,
     pub(crate) tls_verification: TlsVerificationMode,
     pub(crate) tls_ca_cert_path: String,
+    pub(crate) automatic_reconnect: bool,
+    pub(crate) reconnect_max_delay_secs: u16,
 }
 
 impl Default for MqttLoginData {
@@ -141,6 +143,8 @@ impl Default for MqttLoginData {
             ws_path: DEFAULT_WS_PATH.to_string(),
             tls_verification: TlsVerificationMode::SystemRoots,
             tls_ca_cert_path: String::new(),
+            automatic_reconnect: true,
+            reconnect_max_delay_secs: 30,
         }
     }
 }

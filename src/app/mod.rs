@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use eframe::egui;
 use tokio::runtime::Runtime;
@@ -7,7 +7,7 @@ use crate::app::config_profiles::ProfileEntry;
 use crate::app::state::{Tab, TabKind, TabState};
 use crate::client;
 use crate::models::client::ClientHandle;
-use crate::models::ipc::ClientCommand;
+use crate::models::ipc::{ClientCommand, ConnectionState};
 use crate::models::mqtt::MqttLoginData;
 
 pub(crate) mod config_profiles;
@@ -28,6 +28,11 @@ pub struct App {
     pub(crate) profile_status: Option<String>,
     pub(crate) runtime: Runtime,
     pub(crate) clients: HashMap<u64, ClientHandle>,
+    pub(crate) repaint_context: egui::Context,
+    pub(crate) reconnect_attempts: HashMap<u64, u32>,
+    pub(crate) reconnect_deadlines: HashMap<u64, std::time::Instant>,
+    pub(crate) manually_disconnected: HashSet<u64>,
+    pub(crate) connection_states: HashMap<u64, ConnectionState>,
 }
 
 impl Default for App {
@@ -51,6 +56,11 @@ impl Default for App {
             profile_status: None,
             runtime,
             clients: HashMap::new(),
+            repaint_context: egui::Context::default(),
+            reconnect_attempts: HashMap::new(),
+            reconnect_deadlines: HashMap::new(),
+            manually_disconnected: HashSet::new(),
+            connection_states: HashMap::new(),
         };
 
         app.refresh_profiles();
@@ -117,6 +127,8 @@ impl App {
         };
 
         self.tabs.push(Tab { id, title, state });
+        self.connection_states
+            .insert(id, ConnectionState::Connecting);
         self.active_tab = Some(id);
 
         self.start_client(id);
@@ -128,6 +140,7 @@ impl App {
         };
 
         self.stop_client(tab_id);
+        self.connection_states.remove(&tab_id);
         self.tabs.remove(idx);
 
         if self.active_tab == Some(tab_id) {
@@ -142,15 +155,31 @@ impl App {
     }
 
     pub(crate) fn disconnect_client(&mut self, tab_id: u64) {
-        self.send_client_command(tab_id, ClientCommand::Disconnect);
+        let was_connected =
+            self.connection_states.get(&tab_id) == Some(&ConnectionState::Connected);
+        self.manually_disconnected.insert(tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Disconnecting);
+        if was_connected {
+            self.send_client_command(tab_id, ClientCommand::Disconnect);
+        } else {
+            self.stop_client(tab_id);
+            self.set_connection_state(tab_id, ConnectionState::Disconnected);
+        }
     }
 
     pub(crate) fn force_disconnect_client(&mut self, tab_id: u64) {
-        self.send_client_command(tab_id, ClientCommand::ForceDisconnect);
+        self.manually_disconnected.insert(tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Disconnecting);
+        self.stop_client(tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Disconnected);
     }
 
     pub(crate) fn reconnect_client(&mut self, tab_id: u64) {
         self.stop_client(tab_id);
+        self.reconnect_attempts.remove(&tab_id);
+        self.reconnect_deadlines.remove(&tab_id);
+        self.manually_disconnected.remove(&tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Reconnecting);
 
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
             let TabState::Client {
@@ -228,16 +257,30 @@ impl App {
             return;
         };
 
-        let handle = client::spawn_client(&self.runtime, tab_id, login);
+        let subscriptions = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| match &tab.state {
+                TabState::Client { subscriptions, .. } => subscriptions.clone(),
+            })
+            .unwrap_or_default();
+        let handle =
+            client::spawn_client(&self.runtime, tab_id, login, self.repaint_context.clone());
+        for subscription in subscriptions {
+            let _ = handle.command_tx.try_send(ClientCommand::Subscribe {
+                topic: subscription.topic,
+                qos: subscription.qos,
+            });
+        }
         self.clients.insert(tab_id, handle);
     }
 
     fn stop_client(&mut self, tab_id: u64) {
-        if let Some(mut handle) = self.clients.remove(&tab_id) {
-            if let Some(shutdown_tx) = handle.shutdown_tx.take() {
-                let _ = shutdown_tx.send(());
-            }
-            let _ = handle.join_handle.is_finished();
+        self.reconnect_deadlines.remove(&tab_id);
+        if let Some(handle) = self.clients.remove(&tab_id) {
+            handle.cancellation.cancel();
+            handle.join_handle.abort();
         }
     }
 
@@ -246,7 +289,7 @@ impl App {
             return;
         };
 
-        if client.command_tx.send(command).is_err()
+        if client.command_tx.try_send(command).is_err()
             && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
             let TabState::Client {
@@ -353,6 +396,74 @@ impl App {
             self.stop_client(id);
         }
     }
+
+    pub(crate) fn set_connection_state(&mut self, tab_id: u64, state: ConnectionState) {
+        let valid = self
+            .connection_states
+            .get(&tab_id)
+            .is_none_or(|current| current.can_transition_to(state));
+        if valid {
+            self.connection_states.insert(tab_id, state);
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                let TabState::Client {
+                    connection_status, ..
+                } = &mut tab.state;
+                *connection_status = state.to_string();
+            }
+        }
+    }
+
+    fn maintain_clients(&mut self) {
+        let finished: Vec<u64> = self
+            .clients
+            .iter()
+            .filter_map(|(id, handle)| handle.join_handle.is_finished().then_some(*id))
+            .collect();
+        for id in finished {
+            self.clients.remove(&id);
+            let Some((enabled, maximum)) = self.tabs.iter().find_map(|tab| {
+                (tab.id == id).then(|| match &tab.state {
+                    TabState::Client { mqtt_login, .. } => (
+                        mqtt_login.automatic_reconnect,
+                        std::time::Duration::from_secs(u64::from(
+                            mqtt_login.reconnect_max_delay_secs.max(1),
+                        )),
+                    ),
+                })
+            }) else {
+                continue;
+            };
+            if self.manually_disconnected.contains(&id) {
+                self.set_connection_state(id, ConnectionState::Disconnected);
+            } else if enabled {
+                self.set_connection_state(id, ConnectionState::Reconnecting);
+                let attempt = self.reconnect_attempts.entry(id).or_default();
+                let delay = client::reconnect_delay(*attempt, maximum);
+                *attempt = attempt.saturating_add(1);
+                self.reconnect_deadlines
+                    .insert(id, std::time::Instant::now() + delay);
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                    let TabState::Client {
+                        connection_status, ..
+                    } = &mut tab.state;
+                    *connection_status = format!("Reconnecting in {:.1}s", delay.as_secs_f32());
+                }
+            } else {
+                self.set_connection_state(id, ConnectionState::Failed);
+            }
+        }
+
+        let now = std::time::Instant::now();
+        let due: Vec<u64> = self
+            .reconnect_deadlines
+            .iter()
+            .filter_map(|(id, deadline)| (*deadline <= now).then_some(*id))
+            .collect();
+        for id in due {
+            self.reconnect_deadlines.remove(&id);
+            self.start_client(id);
+        }
+    }
 }
 
 impl Drop for App {
@@ -363,8 +474,17 @@ impl Drop for App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.repaint_context = ui.ctx().clone();
+        self.maintain_clients();
         events::pump_client_events(self);
         crate::ui::render(self, ui);
-        ui.ctx().request_repaint();
+        if let Some(delay) = self
+            .reconnect_deadlines
+            .values()
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+            .min()
+        {
+            ui.ctx().request_repaint_after(delay);
+        }
     }
 }
