@@ -67,8 +67,12 @@ pub(crate) fn reduce_client_event(
 
     match event {
         ClientEvent::State(state) => {
-            *connection_state = state;
-            Some(state)
+            if connection_state.can_transition_to(state) {
+                *connection_state = state;
+                Some(state)
+            } else {
+                None
+            }
         }
         ClientEvent::Status(status) => {
             push_activity(activity, now, ActivityLevel::Info, status);
@@ -82,12 +86,18 @@ pub(crate) fn reduce_client_event(
             None
         }
         ClientEvent::Connected => {
+            if !connection_state.can_transition_to(ConnectionState::Connected) {
+                return None;
+            }
             *connection_state = ConnectionState::Connected;
             clear_error(current_error, ErrorScope::Connection);
             push_activity(activity, now, ActivityLevel::Success, "Connected");
             Some(ConnectionState::Connected)
         }
         ClientEvent::Disconnected(message) => {
+            if !connection_state.can_transition_to(ConnectionState::Failed) {
+                return None;
+            }
             *connection_state = ConnectionState::Failed;
             *current_error = Some(ActionableError {
                 message,
@@ -166,6 +176,7 @@ pub(crate) fn reduce_client_event(
 }
 
 pub(crate) fn pump_client_events(app: &mut App) {
+    let mut state_updates = Vec::new();
     for tab in &mut app.tabs {
         let TabState::Client {
             dropped_message_count,
@@ -187,13 +198,16 @@ pub(crate) fn pump_client_events(app: &mut App) {
                     if let Some(state) =
                         reduce_client_event(&mut tab.state, event, SystemTime::now())
                     {
-                        app.connection_states.insert(tab.id, state);
+                        state_updates.push((tab.id, state));
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
         }
+    }
+    for (tab_id, state) in state_updates {
+        app.set_connection_state(tab_id, state);
     }
 }
 
@@ -268,8 +282,68 @@ mod tests {
             ClientEvent::Disconnected("Connection refused".into()),
             SystemTime::now(),
         );
+        reduce_client_event(
+            &mut state,
+            ClientEvent::State(ConnectionState::Reconnecting),
+            SystemTime::now(),
+        );
         reduce_client_event(&mut state, ClientEvent::Connected, SystemTime::now());
         assert!(error(&state).is_none());
+    }
+
+    #[test]
+    fn failed_initial_connection_and_automatic_retry_are_validated() {
+        let mut state = state();
+        assert_eq!(
+            reduce_client_event(
+                &mut state,
+                ClientEvent::Disconnected("Connection refused".into()),
+                SystemTime::now(),
+            ),
+            Some(ConnectionState::Failed)
+        );
+        assert_eq!(
+            reduce_client_event(
+                &mut state,
+                ClientEvent::State(ConnectionState::Reconnecting),
+                SystemTime::now(),
+            ),
+            Some(ConnectionState::Reconnecting)
+        );
+        assert_eq!(
+            reduce_client_event(
+                &mut state,
+                ClientEvent::State(ConnectionState::Connecting),
+                SystemTime::now(),
+            ),
+            Some(ConnectionState::Connecting)
+        );
+    }
+
+    #[test]
+    fn connection_success_and_successful_recovery_are_validated() {
+        let mut initial = state();
+        assert_eq!(
+            reduce_client_event(&mut initial, ClientEvent::Connected, SystemTime::now()),
+            Some(ConnectionState::Connected)
+        );
+
+        let mut recovery = state();
+        reduce_client_event(
+            &mut recovery,
+            ClientEvent::Disconnected("Network lost".into()),
+            SystemTime::now(),
+        );
+        reduce_client_event(
+            &mut recovery,
+            ClientEvent::State(ConnectionState::Reconnecting),
+            SystemTime::now(),
+        );
+        assert_eq!(
+            reduce_client_event(&mut recovery, ClientEvent::Connected, SystemTime::now()),
+            Some(ConnectionState::Connected)
+        );
+        assert!(error(&recovery).is_none());
     }
 
     #[test]

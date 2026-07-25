@@ -15,6 +15,29 @@ impl std::fmt::Display for ConnectionState {
 }
 
 impl ConnectionState {
+    pub(crate) const fn can_connect(self) -> bool {
+        matches!(self, Self::Connected | Self::Disconnected | Self::Failed)
+    }
+
+    pub(crate) const fn can_disconnect(self) -> bool {
+        matches!(
+            self,
+            Self::Connecting | Self::Connected | Self::Reconnecting
+        )
+    }
+
+    pub(crate) const fn can_force_disconnect(self) -> bool {
+        !matches!(self, Self::Disconnected)
+    }
+
+    pub(crate) const fn can_use_client(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+
+    pub(crate) const fn can_cancel_reconnect(self) -> bool {
+        matches!(self, Self::Reconnecting)
+    }
+
     pub(crate) fn can_transition_to(self, next: Self) -> bool {
         use ConnectionState::{
             Connected, Connecting, Disconnected, Disconnecting, Failed, Reconnecting,
@@ -22,9 +45,10 @@ impl ConnectionState {
         matches!(
             (self, next),
             (Disconnected | Failed, Connecting | Reconnecting)
+                | (Connecting, Connected | Failed | Disconnecting)
                 | (
-                    Connecting | Reconnecting,
-                    Connected | Failed | Disconnecting
+                    Reconnecting,
+                    Connecting | Connected | Failed | Disconnecting
                 )
                 | (Connected, Reconnecting | Disconnecting | Failed)
                 | (Disconnecting, Disconnected | Failed)
@@ -42,10 +66,23 @@ mod tests {
         assert!(Connecting.can_transition_to(Connected));
         assert!(Connected.can_transition_to(Reconnecting));
         assert!(Reconnecting.can_transition_to(Failed));
+        assert!(Reconnecting.can_transition_to(Connecting));
         assert!(Connected.can_transition_to(Disconnecting));
         assert!(Disconnecting.can_transition_to(Disconnected));
         assert!(!Disconnected.can_transition_to(Connected));
         assert!(!Connected.can_transition_to(Connecting));
+    }
+
+    #[test]
+    fn allowed_actions_follow_connection_state() {
+        assert!(Disconnected.can_connect());
+        assert!(Failed.can_connect());
+        assert!(Connected.can_connect());
+        assert!(Connected.can_disconnect());
+        assert!(Reconnecting.can_cancel_reconnect());
+        assert!(Connected.can_use_client());
+        assert!(!Connecting.can_use_client());
+        assert!(!Disconnected.can_force_disconnect());
     }
 }
 

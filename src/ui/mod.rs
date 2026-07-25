@@ -16,6 +16,22 @@ use crate::utils::formatting::{format_json, format_payload, format_timestamp};
 
 pub(crate) mod widgets;
 
+fn connection_color(state: ConnectionState, visuals: &egui::Visuals) -> egui::Color32 {
+    match state {
+        ConnectionState::Connected => egui::Color32::from_rgb(70, 170, 90),
+        ConnectionState::Failed => egui::Color32::from_rgb(220, 70, 70),
+        ConnectionState::Connecting | ConnectionState::Reconnecting => {
+            egui::Color32::from_rgb(230, 170, 40)
+        }
+        ConnectionState::Disconnecting => visuals.warn_fg_color,
+        ConnectionState::Disconnected => visuals.weak_text_color(),
+    }
+}
+
+fn disabled_reason(action: &str, state: ConnectionState) -> String {
+    format!("{action} is unavailable while the connection is {state}.")
+}
+
 fn message_matches(
     message: &ReceivedMessage,
     topic_filter: &str,
@@ -154,6 +170,11 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                 } else {
                                     ui.visuals().text_color()
                                 };
+                                let connection_state = match &tab.state {
+                                    TabState::Client {
+                                        connection_state, ..
+                                    } => *connection_state,
+                                };
 
                                 egui::Frame::new()
                                     .fill(frame_fill)
@@ -162,6 +183,13 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                     .inner_margin(egui::Margin::symmetric(12, 7))
                                     .show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
+                                        ui.colored_label(
+                                            connection_color(connection_state, ui.visuals()),
+                                            "●",
+                                        )
+                                        .on_hover_text(
+                                            format!("Connection state: {connection_state}"),
+                                        );
 
                                         let tab_response = ui.add(
                                             egui::Label::new(
@@ -187,15 +215,50 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                         }
 
                                         tab_response.context_menu(|ui| {
-                                            if ui.button("Disconnect").clicked() {
+                                            let disconnect = ui
+                                                .add_enabled(
+                                                    connection_state.can_disconnect(),
+                                                    egui::Button::new("Disconnect"),
+                                                )
+                                                .on_disabled_hover_text(disabled_reason(
+                                                    "Disconnect",
+                                                    connection_state,
+                                                ));
+                                            if disconnect.clicked() {
                                                 tab_to_disconnect = Some(tab_id);
                                                 ui.close();
                                             }
-                                            if ui.button("Force Disconnect").clicked() {
+                                            let force = ui
+                                                .add_enabled(
+                                                    connection_state.can_force_disconnect(),
+                                                    egui::Button::new("Force Disconnect"),
+                                                )
+                                                .on_disabled_hover_text(disabled_reason(
+                                                    "Force Disconnect",
+                                                    connection_state,
+                                                ));
+                                            if force.clicked() {
                                                 tab_to_force_disconnect = Some(tab_id);
                                                 ui.close();
                                             }
-                                            if ui.button("Reconnect").clicked() {
+                                            let reconnect = ui
+                                                .add_enabled(
+                                                    connection_state.can_connect(),
+                                                    egui::Button::new(
+                                                        if connection_state
+                                                            == ConnectionState::Disconnected
+                                                        {
+                                                            "Connect"
+                                                        } else {
+                                                            "Reconnect"
+                                                        },
+                                                    ),
+                                                )
+                                                .on_disabled_hover_text(disabled_reason(
+                                                    "Connect/Reconnect",
+                                                    connection_state,
+                                                ));
+                                            if reconnect.clicked() {
                                                 tab_to_reconnect = Some(tab_id);
                                                 ui.close();
                                             }
@@ -747,6 +810,15 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         };
 
         let mut commands_to_send: Vec<ClientCommand> = Vec::new();
+        let reconnect_attempt = app.reconnect_attempts.get(&active_id).copied();
+        let retry_remaining = app
+            .reconnect_deadlines
+            .get(&active_id)
+            .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+        let mut disconnect_clicked = false;
+        let mut force_disconnect_clicked = false;
+        let mut reconnect_clicked = false;
+        let mut cancel_reconnect_clicked = false;
 
         match &mut tab.state {
             TabState::Client {
@@ -780,21 +852,63 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 ..
             } => {
                 ui.heading("MQTT Client");
-                ui.label(format!(
-                    "Connection: {}",
-                    mqtt_login.display_connection_label()
-                ));
-                let status_color = match connection_state {
-                    ConnectionState::Connected => egui::Color32::from_rgb(70, 170, 90),
-                    ConnectionState::Failed => egui::Color32::from_rgb(220, 70, 70),
-                    ConnectionState::Reconnecting | ConnectionState::Disconnecting => {
-                        ui.visuals().warn_fg_color
-                    }
-                    ConnectionState::Connecting | ConnectionState::Disconnected => {
-                        ui.visuals().text_color()
-                    }
-                };
+                ui.label(format!("Broker / transport: {}", mqtt_login.display_connection_label()));
+                let status_color = connection_color(*connection_state, ui.visuals());
                 ui.colored_label(status_color, format!("Status: {connection_state}"));
+                if let Some(attempt) = reconnect_attempt {
+                    ui.label(format!("Reconnect attempt: {attempt}"));
+                }
+                if let Some(remaining) = retry_remaining {
+                    ui.label(format!("Next retry in: {:.1}s", remaining.as_secs_f32()));
+                }
+                ui.horizontal(|ui| {
+                    let reconnect = ui
+                        .add_enabled(
+                            connection_state.can_connect(),
+                            egui::Button::new(if *connection_state
+                                == ConnectionState::Disconnected
+                            {
+                                "Connect"
+                            } else {
+                                "Reconnect"
+                            }),
+                        )
+                        .on_disabled_hover_text(disabled_reason(
+                            "Connect/Reconnect",
+                            *connection_state,
+                        ));
+                    reconnect_clicked = reconnect.clicked();
+                    let disconnect = ui
+                        .add_enabled(
+                            connection_state.can_disconnect(),
+                            egui::Button::new("Disconnect"),
+                        )
+                        .on_disabled_hover_text(disabled_reason(
+                            "Disconnect",
+                            *connection_state,
+                        ));
+                    disconnect_clicked = disconnect.clicked();
+                    let force = ui
+                        .add_enabled(
+                            connection_state.can_force_disconnect(),
+                            egui::Button::new("Force Disconnect"),
+                        )
+                        .on_disabled_hover_text(disabled_reason(
+                            "Force Disconnect",
+                            *connection_state,
+                        ));
+                    force_disconnect_clicked = force.clicked();
+                    let cancel = ui
+                        .add_enabled(
+                            connection_state.can_cancel_reconnect(),
+                            egui::Button::new("Cancel reconnect"),
+                        )
+                        .on_disabled_hover_text(disabled_reason(
+                            "Cancel reconnect",
+                            *connection_state,
+                        ));
+                    cancel_reconnect_clicked = cancel.clicked();
+                });
                 if let Some(err) = current_error.as_ref() {
                     let message = err.message.clone();
                     let mut dismiss = false;
@@ -852,7 +966,16 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     ui.text_edit_singleline(subscribe_topic);
                     ui.label("QoS");
                     qos_picker(ui, &format!("sub_qos_{active_id}"), subscribe_qos);
-                    if ui.button("Subscribe").clicked() {
+                    let subscribe = ui
+                        .add_enabled(
+                            connection_state.can_use_client(),
+                            egui::Button::new("Subscribe"),
+                        )
+                        .on_disabled_hover_text(disabled_reason(
+                            "Subscribe",
+                            *connection_state,
+                        ));
+                    if subscribe.clicked() {
                         let topic = subscribe_topic.trim().to_string();
                         if !topic.is_empty() {
                             commands_to_send.push(ClientCommand::Subscribe {
@@ -884,7 +1007,16 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                                 egui::Label::new(format!("(QoS {})", entry.qos))
                                                     .sense(egui::Sense::click()),
                                             );
-                                            if ui.small_button("Remove").clicked() {
+                                            let remove = ui
+                                                .add_enabled(
+                                                    connection_state.can_use_client(),
+                                                    egui::Button::new("Remove").small(),
+                                                )
+                                                .on_disabled_hover_text(disabled_reason(
+                                                    "Unsubscribe",
+                                                    *connection_state,
+                                                ));
+                                            if remove.clicked() {
                                                 remove_topic = Some(entry.topic.clone());
                                             }
                                             (topic_response, qos_response)
@@ -898,7 +1030,17 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                             edit_topic = Some((entry.topic.clone(), entry.qos));
                                             ui.close();
                                         }
-                                        if ui.button("Unsubscribe").clicked() {
+                                        if ui
+                                            .add_enabled(
+                                                connection_state.can_use_client(),
+                                                egui::Button::new("Unsubscribe"),
+                                            )
+                                            .on_disabled_hover_text(disabled_reason(
+                                                "Unsubscribe",
+                                                *connection_state,
+                                            ))
+                                            .clicked()
+                                        {
                                             remove_topic = Some(entry.topic.clone());
                                             ui.close();
                                         }
@@ -1010,7 +1152,13 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 });
                 ui.label("Payload");
                 ui.add(egui::TextEdit::multiline(publish_payload).desired_rows(3));
-                if ui.button("Publish message").clicked() {
+                let publish = ui
+                    .add_enabled(
+                        connection_state.can_use_client(),
+                        egui::Button::new("Publish message"),
+                    )
+                    .on_disabled_hover_text(disabled_reason("Publish", *connection_state));
+                if publish.clicked() {
                     let topic = publish_topic.trim().to_string();
                     if !topic.is_empty() {
                         commands_to_send.push(ClientCommand::Publish {
@@ -1232,6 +1380,15 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
 
         for command in commands_to_send {
             app.send_client_command(active_id, command);
+        }
+        if reconnect_clicked {
+            app.reconnect_client(active_id);
+        } else if cancel_reconnect_clicked {
+            app.cancel_reconnect(active_id);
+        } else if force_disconnect_clicked {
+            app.force_disconnect_client(active_id);
+        } else if disconnect_clicked {
+            app.disconnect_client(active_id);
         }
     });
 }

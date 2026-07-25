@@ -19,6 +19,31 @@ pub(crate) mod events;
 pub(crate) mod persistence;
 pub(crate) mod state;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientCommandResult {
+    Accepted,
+    NoClientHandle,
+    ClientTaskFinished,
+    ChannelFull,
+    ChannelClosed,
+}
+
+impl ClientCommandResult {
+    pub(crate) const fn user_message(self) -> Option<&'static str> {
+        match self {
+            Self::Accepted => None,
+            Self::NoClientHandle => Some("No client is running; connect and try again."),
+            Self::ClientTaskFinished => {
+                Some("The client task has finished; reconnect and try again.")
+            }
+            Self::ChannelFull => Some("The client command queue is full; wait and try again."),
+            Self::ChannelClosed => {
+                Some("The client command channel is closed; reconnect and try again.")
+            }
+        }
+    }
+}
+
 pub struct App {
     pub(crate) next_tab_id: u64,
     pub(crate) tabs: Vec<Tab>,
@@ -250,9 +275,15 @@ impl App {
         let was_connected =
             self.connection_states.get(&tab_id) == Some(&ConnectionState::Connected);
         self.manually_disconnected.insert(tab_id);
+        self.reconnect_deadlines.remove(&tab_id);
         self.set_connection_state(tab_id, ConnectionState::Disconnecting);
         if was_connected {
-            self.send_client_command(tab_id, ClientCommand::Disconnect);
+            if self.send_client_command(tab_id, ClientCommand::Disconnect)
+                != ClientCommandResult::Accepted
+            {
+                self.stop_client(tab_id);
+                self.set_connection_state(tab_id, ConnectionState::Disconnected);
+            }
         } else {
             self.stop_client(tab_id);
             self.set_connection_state(tab_id, ConnectionState::Disconnected);
@@ -261,6 +292,7 @@ impl App {
 
     pub(crate) fn force_disconnect_client(&mut self, tab_id: u64) {
         self.manually_disconnected.insert(tab_id);
+        self.reconnect_deadlines.remove(&tab_id);
         self.set_connection_state(tab_id, ConnectionState::Disconnecting);
         self.stop_client(tab_id);
         self.set_connection_state(tab_id, ConnectionState::Disconnected);
@@ -274,6 +306,14 @@ impl App {
         self.set_connection_state(tab_id, ConnectionState::Reconnecting);
 
         self.start_client(tab_id);
+    }
+
+    pub(crate) fn cancel_reconnect(&mut self, tab_id: u64) {
+        self.manually_disconnected.insert(tab_id);
+        self.reconnect_deadlines.remove(&tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Disconnecting);
+        self.stop_client(tab_id);
+        self.set_connection_state(tab_id, ConnectionState::Disconnected);
     }
 
     pub(crate) fn duplicate_tab(&mut self, tab_id: u64) {
@@ -373,20 +413,36 @@ impl App {
         }
     }
 
-    pub(crate) fn send_client_command(&mut self, tab_id: u64, command: ClientCommand) {
-        let Some(client) = self.clients.get_mut(&tab_id) else {
-            return;
+    pub(crate) fn send_client_command(
+        &mut self,
+        tab_id: u64,
+        command: ClientCommand,
+    ) -> ClientCommandResult {
+        let result = match self.clients.get_mut(&tab_id) {
+            None => ClientCommandResult::NoClientHandle,
+            Some(client) if client.join_handle.is_finished() => {
+                ClientCommandResult::ClientTaskFinished
+            }
+            Some(client) => match client.command_tx.try_send(command) {
+                Ok(()) => ClientCommandResult::Accepted,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    ClientCommandResult::ChannelFull
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    ClientCommandResult::ChannelClosed
+                }
+            },
         };
-
-        if client.command_tx.try_send(command).is_err()
+        if let Some(message) = result.user_message()
             && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
             let TabState::Client { current_error, .. } = &mut tab.state;
             *current_error = Some(ActionableError {
-                message: "The client task is unavailable; reconnect and try again.".to_string(),
-                scope: ErrorScope::Connection,
+                message: message.to_string(),
+                scope: ErrorScope::General,
             });
         }
+        result
     }
 
     pub(crate) fn refresh_profiles(&mut self) {
@@ -565,6 +621,11 @@ impl App {
             .get(&tab_id)
             .is_none_or(|current| current.can_transition_to(state));
         if valid {
+            if state == ConnectionState::Connected {
+                self.reconnect_attempts.remove(&tab_id);
+                self.reconnect_deadlines.remove(&tab_id);
+                self.manually_disconnected.remove(&tab_id);
+            }
             self.connection_states.insert(tab_id, state);
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                 let TabState::Client {
@@ -635,6 +696,7 @@ impl App {
             .collect();
         for id in due {
             self.reconnect_deadlines.remove(&id);
+            self.set_connection_state(id, ConnectionState::Connecting);
             self.start_client(id);
         }
     }
@@ -678,5 +740,100 @@ impl eframe::App for App {
 
     fn auto_save_interval(&self) -> Duration {
         Duration::from_secs(30)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+        mpsc,
+    };
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::models::client::ClientHandle;
+
+    fn empty_app() -> App {
+        let mut app = App::default();
+        app.stop_all_clients();
+        app.tabs.clear();
+        app.clients.clear();
+        app.connection_states.clear();
+        app.reconnect_attempts.clear();
+        app.reconnect_deadlines.clear();
+        app.manually_disconnected.clear();
+        app
+    }
+
+    #[test]
+    fn command_without_a_live_client_is_reported() {
+        let mut app = empty_app();
+        assert_eq!(
+            app.send_client_command(99, ClientCommand::Disconnect),
+            ClientCommandResult::NoClientHandle
+        );
+    }
+
+    #[test]
+    fn queue_full_is_distinct_from_a_closed_channel() {
+        let mut app = empty_app();
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+        command_tx.try_send(ClientCommand::Disconnect).unwrap();
+        let (_event_tx, event_rx) = mpsc::sync_channel(1);
+        let join_handle = app.runtime.spawn(std::future::pending());
+        app.clients.insert(
+            7,
+            ClientHandle {
+                cancellation: CancellationToken::new(),
+                join_handle,
+                event_rx,
+                command_tx,
+                queued_messages: Arc::new(AtomicUsize::new(0)),
+                dropped_messages: Arc::new(AtomicU64::new(0)),
+            },
+        );
+        assert_eq!(
+            app.send_client_command(7, ClientCommand::Disconnect),
+            ClientCommandResult::ChannelFull
+        );
+    }
+
+    #[test]
+    fn manual_disconnect_during_backoff_and_cancel_reconnect_stop_restart() {
+        let mut app = empty_app();
+        for id in [1, 2] {
+            app.connection_states
+                .insert(id, ConnectionState::Reconnecting);
+            app.reconnect_deadlines
+                .insert(id, Instant::now() + Duration::from_secs(30));
+        }
+
+        app.disconnect_client(1);
+        app.cancel_reconnect(2);
+
+        for id in [1, 2] {
+            assert_eq!(
+                app.connection_states.get(&id),
+                Some(&ConnectionState::Disconnected)
+            );
+            assert!(!app.reconnect_deadlines.contains_key(&id));
+            assert!(app.manually_disconnected.contains(&id));
+        }
+    }
+
+    #[test]
+    fn successful_connection_resets_reconnect_bookkeeping() {
+        let mut app = empty_app();
+        app.connection_states
+            .insert(1, ConnectionState::Reconnecting);
+        app.reconnect_attempts.insert(1, 4);
+        app.reconnect_deadlines
+            .insert(1, Instant::now() + Duration::from_secs(30));
+        app.set_connection_state(1, ConnectionState::Connected);
+        assert!(!app.reconnect_attempts.contains_key(&1));
+        assert!(!app.reconnect_deadlines.contains_key(&1));
     }
 }
