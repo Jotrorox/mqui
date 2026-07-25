@@ -1,6 +1,39 @@
 use std::collections::VecDeque;
+use std::time::SystemTime;
 
+use crate::models::ipc::ConnectionState;
 use crate::models::mqtt::{MqttLoginData, ReceivedMessage, SubscriptionEntry};
+
+pub(crate) const MAX_ACTIVITY_ITEMS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorScope {
+    Connection,
+    Subscribe,
+    Unsubscribe,
+    Publish,
+    General,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActionableError {
+    pub(crate) message: String,
+    pub(crate) scope: ErrorScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityLevel {
+    Info,
+    Success,
+    Warning,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActivityItem {
+    pub(crate) timestamp: SystemTime,
+    pub(crate) level: ActivityLevel,
+    pub(crate) message: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabKind {
@@ -11,8 +44,9 @@ pub(crate) enum TabKind {
 pub(crate) enum TabState {
     Client {
         mqtt_login: MqttLoginData,
-        connection_status: String,
-        last_error: Option<String>,
+        connection_state: ConnectionState,
+        current_error: Option<ActionableError>,
+        activity: VecDeque<ActivityItem>,
         subscribe_topic: String,
         subscribe_qos: u8,
         unsubscribe_topic: String,

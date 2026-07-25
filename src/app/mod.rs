@@ -4,7 +4,7 @@ use eframe::egui;
 use tokio::runtime::Runtime;
 
 use crate::app::config_profiles::ProfileEntry;
-use crate::app::state::{Tab, TabKind, TabState};
+use crate::app::state::{ActionableError, ActivityLevel, ErrorScope, Tab, TabKind, TabState};
 use crate::client;
 use crate::models::client::ClientHandle;
 use crate::models::ipc::{ClientCommand, ConnectionState};
@@ -102,8 +102,9 @@ impl App {
                     title,
                     TabState::Client {
                         mqtt_login,
-                        connection_status: "Connecting...".to_string(),
-                        last_error: None,
+                        connection_state: ConnectionState::Connecting,
+                        current_error: None,
+                        activity: VecDeque::new(),
                         subscribe_topic: "t1".to_string(),
                         subscribe_qos: 0,
                         unsubscribe_topic: "".to_string(),
@@ -182,16 +183,6 @@ impl App {
         self.reconnect_deadlines.remove(&tab_id);
         self.manually_disconnected.remove(&tab_id);
         self.set_connection_state(tab_id, ConnectionState::Reconnecting);
-
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
-            let TabState::Client {
-                connection_status,
-                last_error,
-                ..
-            } = &mut tab.state;
-            *connection_status = "Reconnecting...".to_string();
-            *last_error = None;
-        }
 
         self.start_client(tab_id);
     }
@@ -301,13 +292,11 @@ impl App {
         if client.command_tx.try_send(command).is_err()
             && let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id)
         {
-            let TabState::Client {
-                connection_status,
-                last_error,
-                ..
-            } = &mut tab.state;
-            *connection_status = "Client task is not available".to_string();
-            *last_error = Some("Command channel is closed".to_string());
+            let TabState::Client { current_error, .. } = &mut tab.state;
+            *current_error = Some(ActionableError {
+                message: "The client task is unavailable; reconnect and try again.".to_string(),
+                scope: ErrorScope::Connection,
+            });
         }
     }
 
@@ -415,9 +404,18 @@ impl App {
             self.connection_states.insert(tab_id, state);
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                 let TabState::Client {
-                    connection_status, ..
+                    connection_state,
+                    current_error,
+                    ..
                 } = &mut tab.state;
-                *connection_status = state.to_string();
+                *connection_state = state;
+                if state == ConnectionState::Disconnected
+                    && current_error
+                        .as_ref()
+                        .is_some_and(|error| error.scope == ErrorScope::Connection)
+                {
+                    *current_error = None;
+                }
             }
         }
     }
@@ -452,10 +450,13 @@ impl App {
                 self.reconnect_deadlines
                     .insert(id, std::time::Instant::now() + delay);
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-                    let TabState::Client {
-                        connection_status, ..
-                    } = &mut tab.state;
-                    *connection_status = format!("Reconnecting in {:.1}s", delay.as_secs_f32());
+                    let TabState::Client { activity, .. } = &mut tab.state;
+                    events::push_activity(
+                        activity,
+                        std::time::SystemTime::now(),
+                        ActivityLevel::Warning,
+                        format!("Reconnect scheduled in {:.1}s", delay.as_secs_f32()),
+                    );
                 }
             } else {
                 self.set_connection_state(id, ConnectionState::Failed);

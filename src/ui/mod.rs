@@ -3,8 +3,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::app::App;
-use crate::app::state::{TabKind, TabState};
-use crate::models::ipc::ClientCommand;
+use crate::app::state::{ActionableError, ActivityLevel, ErrorScope, TabKind, TabState};
+use crate::models::ipc::{ClientCommand, ConnectionState};
 use crate::models::mqtt::{ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind};
 use crate::ui::widgets::qos_picker;
 use crate::utils::formatting::{format_payload, format_timestamp};
@@ -585,8 +585,9 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         match &mut tab.state {
             TabState::Client {
                 mqtt_login,
-                connection_status,
-                last_error,
+                connection_state,
+                current_error,
+                activity,
                 subscribe_topic,
                 subscribe_qos,
                 unsubscribe_topic,
@@ -612,9 +613,55 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     "Connection: {}",
                     mqtt_login.display_connection_label()
                 ));
-                ui.label(format!("Status: {connection_status}"));
-                if let Some(err) = last_error {
-                    ui.colored_label(ui.visuals().warn_fg_color, format!("Info: {err}"));
+                let status_color = match connection_state {
+                    ConnectionState::Connected => egui::Color32::from_rgb(70, 170, 90),
+                    ConnectionState::Failed => egui::Color32::from_rgb(220, 70, 70),
+                    ConnectionState::Reconnecting | ConnectionState::Disconnecting => {
+                        ui.visuals().warn_fg_color
+                    }
+                    ConnectionState::Connecting | ConnectionState::Disconnected => {
+                        ui.visuals().text_color()
+                    }
+                };
+                ui.colored_label(status_color, format!("Status: {connection_state}"));
+                if let Some(err) = current_error.as_ref() {
+                    let message = err.message.clone();
+                    let mut dismiss = false;
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 70, 70),
+                            format!("Error: {message}"),
+                        );
+                        dismiss = ui.small_button("Dismiss").clicked();
+                    });
+                    if dismiss {
+                        *current_error = None;
+                    }
+                }
+                if !activity.is_empty() {
+                    egui::CollapsingHeader::new(format!("Recent activity ({})", activity.len()))
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            for item in activity.iter() {
+                                let (label, color) = match item.level {
+                                    ActivityLevel::Info => ("Info", ui.visuals().text_color()),
+                                    ActivityLevel::Success => {
+                                        ("Success", egui::Color32::from_rgb(70, 170, 90))
+                                    }
+                                    ActivityLevel::Warning => {
+                                        ("Warning", ui.visuals().warn_fg_color)
+                                    }
+                                };
+                                ui.colored_label(
+                                    color,
+                                    format!(
+                                        "{} · {label}: {}",
+                                        format_timestamp(item.timestamp),
+                                        item.message
+                                    ),
+                                );
+                            }
+                        });
                 }
                 ui.label(format!(
                     "Totals: {} received / {} published",
@@ -745,7 +792,10 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     if apply {
                         let new_topic = editing_subscription_value.trim().to_string();
                         if new_topic.is_empty() {
-                            *last_error = Some("Subscription topic cannot be empty".to_string());
+                            *current_error = Some(ActionableError {
+                                message: "Subscription topic cannot be empty".to_string(),
+                                scope: ErrorScope::Subscribe,
+                            });
                         } else {
                             let mut changed = new_topic != original_topic;
                             if !changed
