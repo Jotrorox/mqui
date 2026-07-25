@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::runtime::Runtime;
@@ -12,6 +13,7 @@ use crate::models::mqtt::MqttLoginData;
 
 pub(crate) mod config_profiles;
 pub(crate) mod events;
+pub(crate) mod persistence;
 pub(crate) mod state;
 
 pub struct App {
@@ -37,6 +39,11 @@ pub struct App {
     pub(crate) reconnect_deadlines: HashMap<u64, std::time::Instant>,
     pub(crate) manually_disconnected: HashSet<u64>,
     pub(crate) connection_states: HashMap<u64, ConnectionState>,
+    pub(crate) workspace_warning: Option<String>,
+    workspace_path: Option<std::path::PathBuf>,
+    workspace_snapshot: Vec<u8>,
+    workspace_dirty_since: Option<Instant>,
+    restored_connections_pending: Vec<u64>,
 }
 
 impl Default for App {
@@ -69,14 +76,79 @@ impl Default for App {
             reconnect_deadlines: HashMap::new(),
             manually_disconnected: HashSet::new(),
             connection_states: HashMap::new(),
+            workspace_warning: None,
+            workspace_path: persistence::workspace_path().ok(),
+            workspace_snapshot: Vec::new(),
+            workspace_dirty_since: None,
+            restored_connections_pending: Vec::new(),
         };
 
         app.refresh_profiles();
+        app.load_workspace();
         app
     }
 }
 
 impl App {
+    /// Restores durable UI state but deliberately creates no network clients.
+    fn load_workspace(&mut self) {
+        let Some(path) = self.workspace_path.clone() else {
+            self.workspace_warning =
+                Some("Workspace persistence is unavailable on this platform.".to_string());
+            return;
+        };
+        match persistence::load(&path) {
+            Ok(Some(workspace)) => {
+                let restored = workspace.restore();
+                self.tabs = restored.tabs;
+                self.active_tab = restored.active_tab;
+                self.next_tab_id = restored.next_tab_id;
+                self.connection_states = self
+                    .tabs
+                    .iter()
+                    .map(|tab| (tab.id, ConnectionState::Disconnected))
+                    .collect();
+                self.restored_connections_pending = restored.reconnect_tabs;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                self.workspace_warning = Some(format!(
+                    "Could not restore workspace from {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+        self.workspace_snapshot = persistence::serialize(self).unwrap_or_default();
+    }
+
+    fn save_workspace(&mut self, force: bool) {
+        let Some(path) = self.workspace_path.as_deref() else {
+            return;
+        };
+        let Ok(snapshot) = persistence::serialize(self) else {
+            self.workspace_warning = Some("Could not serialize workspace state.".to_string());
+            return;
+        };
+        if snapshot != self.workspace_snapshot {
+            self.workspace_snapshot = snapshot;
+            self.workspace_dirty_since.get_or_insert_with(Instant::now);
+        }
+        let due = self
+            .workspace_dirty_since
+            .is_some_and(|since| since.elapsed() >= Duration::from_millis(750));
+        if force || (due && self.workspace_dirty_since.is_some()) {
+            match persistence::atomic_write(path, &self.workspace_snapshot) {
+                Ok(()) => self.workspace_dirty_since = None,
+                Err(err) => {
+                    self.workspace_warning = Some(format!(
+                        "Could not save workspace to {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
     pub(crate) fn new_tab(&mut self, kind: TabKind, mqtt_login: MqttLoginData) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -561,6 +633,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.save_workspace(true);
         self.stop_all_clients();
     }
 }
@@ -568,9 +641,18 @@ impl Drop for App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.repaint_context = ui.ctx().clone();
+        for id in std::mem::take(&mut self.restored_connections_pending) {
+            self.set_connection_state(id, ConnectionState::Connecting);
+            self.start_client(id);
+        }
         self.maintain_clients();
         events::pump_client_events(self);
         crate::ui::render(self, ui);
+        self.save_workspace(false);
+        if let Some(since) = self.workspace_dirty_since {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(750).saturating_sub(since.elapsed()));
+        }
         if let Some(delay) = self
             .reconnect_deadlines
             .values()
@@ -579,5 +661,13 @@ impl eframe::App for App {
         {
             ui.ctx().request_repaint_after(delay);
         }
+    }
+
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.save_workspace(true);
+    }
+
+    fn auto_save_interval(&self) -> Duration {
+        Duration::from_secs(30)
     }
 }

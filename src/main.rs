@@ -6,7 +6,10 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        persist_window: true,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "MQUI",

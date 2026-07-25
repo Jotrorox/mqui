@@ -73,6 +73,17 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let top_bar_fill = ui.style().visuals.panel_fill;
 
+    if let Some(warning) = app.workspace_warning.clone() {
+        egui::Panel::top("workspace_warning").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+                if ui.small_button("Dismiss").clicked() {
+                    app.workspace_warning = None;
+                }
+            });
+        });
+    }
+
     egui::Panel::top("tab_bar")
         .exact_size(40.0)
         .frame(

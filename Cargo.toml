@@ -17,6 +17,7 @@ rfd = "0.17.2"
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.8.4"
 serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3.27.0"
 # Must match mqtt-endpoint-tokio's public WebSocket transport types.
 tokio-tungstenite = "0.20.1"
 toml = "1.1.3"
