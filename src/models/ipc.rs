@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConnectionState {
+pub enum ConnectionState {
     Connecting,
     Connected,
     Reconnecting,
@@ -50,7 +50,7 @@ mod tests {
 }
 
 #[derive(Debug)]
-pub(crate) enum ClientEvent {
+pub enum ClientEvent {
     State(ConnectionState),
     Status(String),
     Error(String),
@@ -78,7 +78,7 @@ pub(crate) enum ClientEvent {
 }
 
 #[derive(Debug)]
-pub(crate) enum ClientCommand {
+pub enum ClientCommand {
     Disconnect,
     Subscribe {
         topic: String,

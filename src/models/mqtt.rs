@@ -10,7 +10,7 @@ const DEFAULT_WS_PATH: &str = "/mqtt";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum ConnectionInputMode {
+pub enum ConnectionInputMode {
     #[default]
     Structured,
     Url,
@@ -27,7 +27,7 @@ impl ConnectionInputMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum TransportKind {
+pub enum TransportKind {
     #[default]
     Tcp,
     Tls,
@@ -74,7 +74,7 @@ impl TransportKind {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum TlsVerificationMode {
+pub enum TlsVerificationMode {
     #[default]
     SystemRoots,
     CustomCa,
@@ -101,26 +101,26 @@ pub(crate) struct ResolvedConnection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MqttLoginData {
-    pub(crate) name: String,
-    pub(crate) broker: String,
-    pub(crate) port: String,
-    pub(crate) username: String,
-    pub(crate) password: String,
-    pub(crate) client_id: String,
-    pub(crate) keep_alive_secs: u16,
-    pub(crate) testament_and_last_will: String,
-    pub(crate) testament_topic: String,
-    pub(crate) testament_qos: u8,
-    pub(crate) testament_retain: bool,
-    pub(crate) connection_mode: ConnectionInputMode,
-    pub(crate) connection_url: String,
-    pub(crate) transport: TransportKind,
-    pub(crate) ws_path: String,
-    pub(crate) tls_verification: TlsVerificationMode,
-    pub(crate) tls_ca_cert_path: String,
-    pub(crate) automatic_reconnect: bool,
-    pub(crate) reconnect_max_delay_secs: u16,
+pub struct MqttLoginData {
+    pub name: String,
+    pub broker: String,
+    pub port: String,
+    pub username: String,
+    pub password: String,
+    pub client_id: String,
+    pub keep_alive_secs: u16,
+    pub testament_and_last_will: String,
+    pub testament_topic: String,
+    pub testament_qos: u8,
+    pub testament_retain: bool,
+    pub connection_mode: ConnectionInputMode,
+    pub connection_url: String,
+    pub transport: TransportKind,
+    pub ws_path: String,
+    pub tls_verification: TlsVerificationMode,
+    pub tls_ca_cert_path: String,
+    pub automatic_reconnect: bool,
+    pub reconnect_max_delay_secs: u16,
 }
 
 impl Default for MqttLoginData {

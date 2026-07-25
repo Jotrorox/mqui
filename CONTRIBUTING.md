@@ -12,6 +12,16 @@ working with your contribution.
 - The Rust toolchain >= v1.88.0
 - The EGUI build dependencies ([GitHub](https://github.com/emilk/egui))
 - Git for version control
+- Docker with the Compose plugin, for the real-broker integration tests
+
+On Debian/Ubuntu, the native packages used by CI are:
+
+```bash
+sudo apt-get install libasound2-dev libgtk-3-dev libudev-dev libxkbcommon-dev
+```
+
+Windows builds use the standard Rust MSVC toolchain and the Visual Studio C++
+build tools. OpenSSL is only used inside the Mosquitto test container.
 
 ### Setting Up Your Development Environment
 
@@ -55,7 +65,7 @@ Feature suggestions are welcome! Please open an issue with:
 
 2. Make your changes following our coding standards
 
-3. Test your changes thoroughly on a Paper server
+3. Run the validation and integration-test commands documented below
 
 4. Commit your changes with clear, descriptive commit messages:
    ```bash
@@ -80,7 +90,40 @@ TBD
 
 ## Testing
 
-TBD
+Fast unit tests do not need a broker:
+
+```bash
+cargo test --all-targets
+```
+
+The real-broker suite uses the pinned Mosquitto container and covers TCP,
+authentication acceptance and rejection, subscribe/unsubscribe, QoS 0/1/2,
+retained messages, duplicate-client disconnects, TLS with a test CA, and
+WebSockets:
+
+```bash
+docker compose -f test-broker/docker-compose.yml up --detach --wait
+MQUI_INTEGRATION_TESTS=1 cargo test --test mosquitto -- --nocapture
+docker compose -f test-broker/docker-compose.yml down --volumes
+```
+
+The broker generates a short-lived CA and a `localhost` server certificate in
+`test-broker/generated/`. The TLS test explicitly trusts that CA through
+`TlsVerificationMode::CustomCa`; certificate and hostname verification remain
+enabled. Set `MQUI_TEST_CA` if the generated CA is stored elsewhere.
+
+Run the same validation commands used in CI before opening a pull request:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+MQUI_INTEGRATION_TESTS=1 cargo test --all-targets
+cargo check --all-targets --all-features
+```
+
+The integration test has bounded waits, creates unique client IDs and topic
+names, and is skipped unless `MQUI_INTEGRATION_TESTS` is set. CI starts and
+health-checks the broker before enabling it and always tears the broker down.
 
 ## Communication
 
@@ -90,7 +133,7 @@ TBD
 
 ## License
 
-By contributing to SleepyShop, you agree that your contributions will be licensed under the MIT License.
+By contributing to MQUI, you agree that your contributions will be licensed under the MIT License.
 
 ---
 

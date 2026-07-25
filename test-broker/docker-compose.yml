@@ -1,0 +1,23 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    user: "0:0"
+    entrypoint: ["/test/entrypoint.sh"]
+    ports:
+      - "18883:1883"
+      - "18884:1884"
+      - "18885:8883"
+      - "19001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./entrypoint.sh:/test/entrypoint.sh:ro
+      - ./generated:/mosquitto/generated
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mosquitto_pub -h 127.0.0.1 -p 1883 -t health -m ready -q 1",
+        ]
+      interval: 1s
+      timeout: 3s
+      retries: 20

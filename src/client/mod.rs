@@ -31,13 +31,15 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 struct EventSender {
     sender: mpsc::SyncSender<ClientEvent>,
-    ctx: egui::Context,
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl EventSender {
     fn send(&self, event: ClientEvent) -> Result<(), ()> {
         self.sender.try_send(event).map_err(|_| ())?;
-        self.ctx.request_repaint();
+        if let Some(repaint) = &self.repaint {
+            repaint();
+        }
         Ok(())
     }
 
@@ -358,10 +360,32 @@ pub(crate) fn spawn_client(
     login: MqttLoginData,
     ctx: egui::Context,
 ) -> ClientHandle {
+    let repaint = Arc::new(move || ctx.request_repaint());
+    spawn_client_inner(runtime, tab_id, login, Some(repaint))
+}
+
+/// Starts the production MQTT protocol loop without creating an egui window.
+///
+/// This is useful for service integrations and black-box tests. Events can be
+/// received and commands sent through the returned [`ClientHandle`].
+pub fn spawn_headless_client(
+    runtime: &Runtime,
+    client_key: u64,
+    login: MqttLoginData,
+) -> ClientHandle {
+    spawn_client_inner(runtime, client_key, login, None)
+}
+
+fn spawn_client_inner(
+    runtime: &Runtime,
+    tab_id: u64,
+    login: MqttLoginData,
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ClientHandle {
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
     let event_tx = EventSender {
         sender: event_tx,
-        ctx,
+        repaint,
     };
     let (command_tx, mut command_rx) = tokio_mpsc::channel::<ClientCommand>(COMMAND_CAPACITY);
     let cancellation = CancellationToken::new();
