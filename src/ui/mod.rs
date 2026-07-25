@@ -603,7 +603,9 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 subscriptions,
                 messages,
                 received_count,
+                dropped_message_count,
                 published_count,
+                ..
             } => {
                 ui.heading("MQTT Client");
                 ui.label(format!(
@@ -618,6 +620,12 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     "Totals: {} received / {} published",
                     received_count, published_count
                 ));
+                if *dropped_message_count > 0 {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("{dropped_message_count} messages dropped"),
+                    );
+                }
 
                 ui.separator();
                 ui.heading("Subscriptions");

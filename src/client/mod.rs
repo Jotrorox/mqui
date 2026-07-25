@@ -4,6 +4,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Once};
 use std::time::Duration;
@@ -26,21 +27,67 @@ const MQTT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_CAPACITY: usize = 256;
 const EVENT_CAPACITY: usize = 2_048;
+// Message traffic may only occupy this part of the event queue. The remainder
+// stays available for connection state, errors, and protocol acknowledgements.
+const CONTROL_EVENT_RESERVE: usize = 256;
+const MESSAGE_EVENT_CAPACITY: usize = EVENT_CAPACITY - CONTROL_EVENT_RESERVE;
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct EventSender {
     sender: mpsc::SyncSender<ClientEvent>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    queued_messages: Arc<AtomicUsize>,
+    dropped_messages: Arc<AtomicU64>,
+    message_capacity: usize,
 }
 
 impl EventSender {
     fn send(&self, event: ClientEvent) -> Result<(), ()> {
-        self.sender.try_send(event).map_err(|_| ())?;
+        if matches!(event, ClientEvent::MessageReceived { .. }) {
+            return self.send_message(event);
+        }
+
+        self.sender.try_send(event).map_err(|err| {
+            // Control events are protected from message floods by the reserved
+            // queue capacity. If producers themselves exhaust that reserve, do
+            // not turn the failure into silent state loss.
+            eprintln!("mqui: failed to deliver control event: {err}");
+        })?;
         if let Some(repaint) = &self.repaint {
             repaint();
         }
         Ok(())
+    }
+
+    fn send_message(&self, event: ClientEvent) -> Result<(), ()> {
+        let reserved = self
+            .queued_messages
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < self.message_capacity).then_some(queued + 1)
+            })
+            .is_ok();
+        if !reserved {
+            self.record_dropped_message();
+            return Err(());
+        }
+
+        if self.sender.try_send(event).is_err() {
+            self.queued_messages.fetch_sub(1, Ordering::AcqRel);
+            self.record_dropped_message();
+            return Err(());
+        }
+        if let Some(repaint) = &self.repaint {
+            repaint();
+        }
+        Ok(())
+    }
+
+    fn record_dropped_message(&self) {
+        self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+        if let Some(repaint) = &self.repaint {
+            repaint();
+        }
     }
 
     fn try_send(&self, event: ClientEvent) -> Result<(), ()> {
@@ -383,9 +430,14 @@ fn spawn_client_inner(
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> ClientHandle {
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+    let queued_messages = Arc::new(AtomicUsize::new(0));
+    let dropped_messages = Arc::new(AtomicU64::new(0));
     let event_tx = EventSender {
         sender: event_tx,
         repaint,
+        queued_messages: Arc::clone(&queued_messages),
+        dropped_messages: Arc::clone(&dropped_messages),
+        message_capacity: MESSAGE_EVENT_CAPACITY,
     };
     let (command_tx, mut command_rx) = tokio_mpsc::channel::<ClientCommand>(COMMAND_CAPACITY);
     let cancellation = CancellationToken::new();
@@ -1129,6 +1181,8 @@ fn spawn_client_inner(
         join_handle,
         event_rx,
         command_tx,
+        queued_messages,
+        dropped_messages,
     }
 }
 
@@ -1136,6 +1190,136 @@ fn spawn_client_inner(
 mod tests {
     use super::*;
     use mqtt_ep::result_code::{ConnectReasonCode, SubackReasonCode, UnsubackReasonCode};
+    use std::time::Instant;
+
+    fn test_event_sender(
+        channel_capacity: usize,
+        message_capacity: usize,
+    ) -> (
+        EventSender,
+        mpsc::Receiver<ClientEvent>,
+        Arc<AtomicUsize>,
+        Arc<AtomicU64>,
+    ) {
+        let (sender, receiver) = mpsc::sync_channel(channel_capacity);
+        let queued_messages = Arc::new(AtomicUsize::new(0));
+        let dropped_messages = Arc::new(AtomicU64::new(0));
+        (
+            EventSender {
+                sender,
+                repaint: None,
+                queued_messages: Arc::clone(&queued_messages),
+                dropped_messages: Arc::clone(&dropped_messages),
+                message_capacity,
+            },
+            receiver,
+            queued_messages,
+            dropped_messages,
+        )
+    }
+
+    fn received_event(sequence: usize) -> ClientEvent {
+        ClientEvent::MessageReceived {
+            topic: "load/test".to_string(),
+            qos: 0,
+            retain: false,
+            payload: sequence.to_le_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn message_flood_is_bounded_and_counted_while_control_events_remain_observable() {
+        const CHANNEL_CAPACITY: usize = 10;
+        const MESSAGE_CAPACITY: usize = 2;
+        const ATTEMPTS: usize = 10_000;
+        let (sender, receiver, queued, dropped) =
+            test_event_sender(CHANNEL_CAPACITY, MESSAGE_CAPACITY);
+
+        let started = Instant::now();
+        for sequence in 0..ATTEMPTS {
+            let _ = sender.send(received_event(sequence));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "overflow handling must not wait for a consumer"
+        );
+
+        sender
+            .send(ClientEvent::State(ConnectionState::Connected))
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Connected)
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Error("protocol error".to_string()))
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Subscribed {
+                topic: "load/test".to_string(),
+                qos: 1,
+                details: "GrantedQos1".to_string(),
+            })
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Unsubscribed {
+                topic: "load/test".to_string(),
+                details: "Success".to_string(),
+            })
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Published {
+                topic: "load/test".to_string(),
+                packet_id: Some(7),
+            })
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Disconnected("broker closed".to_string()))
+            .expect("reserved control slot");
+        sender
+            .send(ClientEvent::Status("closed".to_string()))
+            .expect("reserved control slot");
+
+        assert_eq!(queued.load(Ordering::Acquire), MESSAGE_CAPACITY);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            (ATTEMPTS - MESSAGE_CAPACITY) as u64
+        );
+
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(events.len(), CHANNEL_CAPACITY);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::State(ConnectionState::Connected)))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ClientEvent::Published {
+                packet_id: Some(7),
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Subscribed { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Unsubscribed { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Error(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::Disconnected(_)))
+        );
+    }
 
     #[test]
     fn reconnect_backoff_is_exponential_and_capped() {

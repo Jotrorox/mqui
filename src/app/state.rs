@@ -29,6 +29,8 @@ pub(crate) enum TabState {
         subscriptions: Vec<SubscriptionEntry>,
         messages: VecDeque<ReceivedMessage>,
         received_count: u64,
+        dropped_message_count: u64,
+        current_client_dropped_message_count: u64,
         published_count: u64,
     },
 }

@@ -120,6 +120,8 @@ impl App {
                         subscriptions: Vec::new(),
                         messages: VecDeque::new(),
                         received_count: 0,
+                        dropped_message_count: 0,
+                        current_client_dropped_message_count: 0,
                         published_count: 0,
                     },
                 )
@@ -245,13 +247,20 @@ impl App {
     }
 
     fn start_client(&mut self, tab_id: u64) {
-        let Some(login) = self.tabs.iter().find_map(|tab| {
+        let Some(login) = self.tabs.iter_mut().find_map(|tab| {
             if tab.id != tab_id {
                 return None;
             }
 
-            match &tab.state {
-                TabState::Client { mqtt_login, .. } => Some(mqtt_login.clone()),
+            match &mut tab.state {
+                TabState::Client {
+                    mqtt_login,
+                    current_client_dropped_message_count,
+                    ..
+                } => {
+                    *current_client_dropped_message_count = 0;
+                    Some(mqtt_login.clone())
+                }
             }
         }) else {
             return;

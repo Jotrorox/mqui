@@ -13,6 +13,8 @@ pub(crate) fn pump_client_events(app: &mut App) {
             subscriptions,
             messages,
             received_count,
+            dropped_message_count,
+            current_client_dropped_message_count,
             published_count,
             ..
         } = &mut tab.state;
@@ -20,9 +22,13 @@ pub(crate) fn pump_client_events(app: &mut App) {
         let Some(client) = app.clients.get_mut(&tab.id) else {
             continue;
         };
+        let current_dropped = client.dropped_message_count();
+        *dropped_message_count +=
+            current_dropped.saturating_sub(*current_client_dropped_message_count);
+        *current_client_dropped_message_count = current_dropped;
 
         loop {
-            match client.event_rx.try_recv() {
+            match client.try_recv() {
                 Ok(ClientEvent::State(state)) => {
                     app.connection_states.insert(tab.id, state);
                     *connection_status = state.to_string();
