@@ -55,7 +55,12 @@ pub(crate) fn reduce_client_event(
         activity,
         subscriptions,
         messages,
+        max_messages,
         received_count,
+        capture_paused,
+        paused_message_count,
+        next_message_id,
+        selected_message_id,
         published_count,
         ..
     } = state;
@@ -140,15 +145,20 @@ pub(crate) fn reduce_client_event(
             payload,
         } => {
             *received_count += 1;
-            messages.push_back(ReceivedMessage {
-                timestamp: now,
-                topic,
-                qos,
-                retain,
-                payload,
-            });
-            while messages.len() > MAX_STORED_MESSAGES {
+            if *capture_paused {
+                *paused_message_count += 1;
+                return None;
+            }
+            let id = *next_message_id;
+            *next_message_id = next_message_id.wrapping_add(1);
+            messages.push_back(ReceivedMessage::new(id, now, topic, qos, retain, payload));
+            while messages.len() > (*max_messages).min(MAX_STORED_MESSAGES) {
                 let _ = messages.pop_front();
+            }
+            if selected_message_id
+                .is_some_and(|selected| !messages.iter().any(|message| message.id == selected))
+            {
+                *selected_message_id = None;
             }
             None
         }
@@ -192,6 +202,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+    use crate::app::state::{MessageFilterMode, PayloadView};
     use crate::models::mqtt::MqttLoginData;
 
     fn state() -> TabState {
@@ -210,9 +221,15 @@ mod tests {
             publish_qos: 0,
             publish_retain: false,
             publish_payload: String::new(),
-            payload_view_hex: false,
+            payload_view: PayloadView::Text,
             topic_filter: String::new(),
+            message_filter_mode: MessageFilterMode::Substring,
+            payload_search: String::new(),
             max_messages: 200,
+            capture_paused: false,
+            paused_message_count: 0,
+            next_message_id: 0,
+            selected_message_id: None,
             subscriptions: Vec::new(),
             messages: VecDeque::new(),
             received_count: 0,
@@ -297,5 +314,74 @@ mod tests {
         let TabState::Client { activity, .. } = state;
         assert_eq!(activity.len(), MAX_ACTIVITY_ITEMS);
         assert_eq!(activity.front().unwrap().message, "Activity 10");
+    }
+
+    fn receive(state: &mut TabState, topic: &str) {
+        reduce_client_event(
+            state,
+            ClientEvent::MessageReceived {
+                topic: topic.into(),
+                qos: 1,
+                retain: false,
+                payload: topic.as_bytes().to_vec(),
+            },
+            SystemTime::now(),
+        );
+    }
+
+    #[test]
+    fn message_ids_are_stable_and_evicted_selection_is_cleared() {
+        let mut state = state();
+        let TabState::Client { max_messages, .. } = &mut state;
+        *max_messages = 2;
+        receive(&mut state, "one");
+        receive(&mut state, "two");
+        let TabState::Client {
+            messages,
+            selected_message_id,
+            ..
+        } = &mut state;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        *selected_message_id = Some(0);
+
+        receive(&mut state, "three");
+        let TabState::Client {
+            messages,
+            selected_message_id,
+            ..
+        } = &state;
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(*selected_message_id, None);
+    }
+
+    #[test]
+    fn paused_capture_counts_without_storing() {
+        let mut state = state();
+        let TabState::Client { capture_paused, .. } = &mut state;
+        *capture_paused = true;
+        receive(&mut state, "skipped");
+        let TabState::Client {
+            messages,
+            received_count,
+            paused_message_count,
+            next_message_id,
+            ..
+        } = &state;
+        assert!(messages.is_empty());
+        assert_eq!(*received_count, 1);
+        assert_eq!(*paused_message_count, 1);
+        assert_eq!(*next_message_id, 0);
     }
 }

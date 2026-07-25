@@ -5,7 +5,10 @@ use eframe::egui;
 use tokio::runtime::Runtime;
 
 use crate::app::config_profiles::ProfileEntry;
-use crate::app::state::{ActionableError, ActivityLevel, ErrorScope, Tab, TabKind, TabState};
+use crate::app::state::{
+    ActionableError, ActivityLevel, ErrorScope, MessageFilterMode, PayloadView, Tab, TabKind,
+    TabState,
+};
 use crate::client;
 use crate::models::client::ClientHandle;
 use crate::models::ipc::{ClientCommand, ConnectionState};
@@ -195,9 +198,15 @@ impl App {
                         publish_qos: 0,
                         publish_retain: false,
                         publish_payload: "hello".to_string(),
-                        payload_view_hex: false,
+                        payload_view: PayloadView::Text,
                         topic_filter: "".to_string(),
+                        message_filter_mode: MessageFilterMode::Substring,
+                        payload_search: String::new(),
                         max_messages: 200,
+                        capture_paused: false,
+                        paused_message_count: 0,
+                        next_message_id: 0,
+                        selected_message_id: None,
                         subscriptions: Vec::new(),
                         messages: VecDeque::new(),
                         received_count: 0,

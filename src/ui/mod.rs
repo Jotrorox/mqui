@@ -3,13 +3,37 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::app::App;
-use crate::app::state::{ActionableError, ActivityLevel, ErrorScope, TabKind, TabState};
+use crate::app::state::{
+    ActionableError, ActivityLevel, ErrorScope, MessageFilterMode, PayloadView, TabKind, TabState,
+};
 use crate::models::ipc::{ClientCommand, ConnectionState};
-use crate::models::mqtt::{ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind};
+use crate::models::mqtt::{
+    ConnectionInputMode, MqttLoginData, ReceivedMessage, TlsVerificationMode, TransportKind,
+    mqtt_topic_matches,
+};
 use crate::ui::widgets::qos_picker;
-use crate::utils::formatting::{format_payload, format_timestamp};
+use crate::utils::formatting::{format_json, format_payload, format_timestamp};
 
 pub(crate) mod widgets;
+
+fn message_matches(
+    message: &ReceivedMessage,
+    topic_filter: &str,
+    mode: MessageFilterMode,
+    payload_search: &str,
+) -> bool {
+    let topic_filter = topic_filter.trim();
+    let topic_matches = topic_filter.is_empty()
+        || match mode {
+            MessageFilterMode::Substring => message.topic.contains(topic_filter),
+            MessageFilterMode::MqttTopic => mqtt_topic_matches(topic_filter, &message.topic),
+        };
+    let payload_search = payload_search.trim();
+    topic_matches
+        && (payload_search.is_empty()
+            || std::str::from_utf8(&message.payload)
+                .is_ok_and(|text| text.contains(payload_search)))
+}
 
 fn topic_color_for(topic: &str, visuals: &egui::Visuals) -> egui::Color32 {
     let palette = [
@@ -740,9 +764,14 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 publish_qos,
                 publish_retain,
                 publish_payload,
-                payload_view_hex,
+                payload_view,
                 topic_filter,
+                message_filter_mode,
+                payload_search,
                 max_messages,
+                capture_paused,
+                paused_message_count,
+                selected_message_id,
                 subscriptions,
                 messages,
                 received_count,
@@ -995,49 +1024,209 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
 
                 ui.separator();
                 ui.heading("Messages");
-                ui.horizontal(|ui| {
-                    ui.label("Filter");
-                    ui.text_edit_singleline(topic_filter);
-                    ui.label("Max rows");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(if *capture_paused {
+                            "Resume capture"
+                        } else {
+                            "Pause capture"
+                        })
+                        .on_hover_text(
+                            "Paused capture still counts incoming messages, but does not store them",
+                        )
+                        .clicked()
+                    {
+                        *capture_paused = !*capture_paused;
+                    }
+                    let status = if *capture_paused { "Paused" } else { "Capturing" };
+                    ui.label(format!("{status} · {paused_message_count} skipped while paused"));
+                    ui.label("Buffer limit");
                     ui.add(egui::DragValue::new(max_messages).range(1..=1000));
-                    ui.checkbox(payload_view_hex, "Hex payload");
-                    if ui.button("Clear").clicked() {
+                    if ui
+                        .button("Clear")
+                        .on_hover_text("Clear the visible buffer and selection; totals are preserved")
+                        .clicked()
+                    {
                         messages.clear();
+                        *selected_message_id = None;
                     }
                 });
+                while messages.len() > *max_messages {
+                    let _ = messages.pop_front();
+                }
+                if selected_message_id.is_some_and(|selected| {
+                    !messages.iter().any(|message| message.id == selected)
+                }) {
+                    *selected_message_id = None;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Topic filter");
+                    ui.text_edit_singleline(topic_filter);
+                    egui::ComboBox::from_id_salt(("message_filter_mode", active_id))
+                        .selected_text(match message_filter_mode {
+                            MessageFilterMode::Substring => "Substring",
+                            MessageFilterMode::MqttTopic => "MQTT filter",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                message_filter_mode,
+                                MessageFilterMode::Substring,
+                                "Substring",
+                            );
+                            ui.selectable_value(
+                                message_filter_mode,
+                                MessageFilterMode::MqttTopic,
+                                "MQTT filter (+ and #)",
+                            );
+                        });
+                    ui.label("Payload text");
+                    ui.text_edit_singleline(payload_search)
+                        .on_hover_text("Searches UTF-8 payloads only");
+                });
 
-                egui::ScrollArea::vertical()
-                    .id_salt(("messages_scroll", active_id))
-                    .show(ui, |ui| {
-                        let filter = topic_filter.trim();
-                        let mut shown = 0usize;
-
-                        for msg in messages.iter().rev() {
-                            if !filter.is_empty() && !msg.topic.contains(filter) {
-                                continue;
+                let inspector_height = ui.available_height().max(220.0);
+                let selected_for_frame = *selected_message_id;
+                let mut next_selection = selected_for_frame;
+                let mut list = |ui: &mut egui::Ui| {
+                    ui.strong("Message list");
+                    egui::ScrollArea::vertical()
+                        .id_salt(("messages_scroll", active_id))
+                        .max_height(inspector_height)
+                        .show(ui, |ui| {
+                            let mut shown = 0usize;
+                            for msg in messages.iter().rev() {
+                                if shown >= *max_messages
+                                    || !message_matches(
+                                        msg,
+                                        topic_filter,
+                                        *message_filter_mode,
+                                        payload_search,
+                                    )
+                                {
+                                    continue;
+                                }
+                                let selected = selected_for_frame == Some(msg.id);
+                                let summary = format!(
+                                    "{}  {}  Q{}{}  {} B\n{}",
+                                    format_timestamp(msg.timestamp),
+                                    msg.topic,
+                                    msg.qos,
+                                    if msg.retain { " R" } else { "" },
+                                    msg.payload.len(),
+                                    msg.preview
+                                );
+                                if ui
+                                    .selectable_label(selected, summary)
+                                    .on_hover_text("Select to inspect this message")
+                                    .clicked()
+                                {
+                                    next_selection = Some(msg.id);
+                                }
+                                shown += 1;
                             }
-                            if shown >= *max_messages {
-                                break;
+                            if shown == 0 {
+                                ui.label("No messages matched the current filters.");
                             }
+                        });
+                };
 
-                            let ts = format_timestamp(msg.timestamp);
-                            let payload_text = format_payload(&msg.payload, *payload_view_hex);
-                            ui.group(|ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(format!("[{ts}] "));
-                                    let color = topic_color_for(&msg.topic, ui.visuals());
-                                    topic_label(ui, &msg.topic, color);
-                                });
-                                ui.label(format!("QoS {} | retain {}", msg.qos, msg.retain));
-                                ui.label(payload_text);
-                            });
-                            shown += 1;
+                let mut detail = |ui: &mut egui::Ui| {
+                    ui.strong("Selected message");
+                    let Some(message) = selected_for_frame
+                        .and_then(|id| messages.iter().find(|message| message.id == id))
+                    else {
+                        ui.label("Select a message from the list.");
+                        return;
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format_timestamp(message.timestamp));
+                        ui.label(format!("QoS {}", message.qos));
+                        ui.label(if message.retain {
+                            "Retained"
+                        } else {
+                            "Not retained"
+                        });
+                        ui.label(format!("{} bytes", message.payload.len()));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let color = topic_color_for(&message.topic, ui.visuals());
+                        topic_label(ui, &message.topic, color);
+                        if ui.button("Copy topic").clicked() {
+                            ui.ctx().copy_text(message.topic.clone());
                         }
-
-                        if shown == 0 {
-                            ui.label("No messages matched current filter.");
+                        if ui.button("Copy payload").clicked() {
+                            ui.ctx().copy_text(
+                                std::str::from_utf8(&message.payload)
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|_| format_payload(&message.payload, true)),
+                            );
+                        }
+                        if ui.button("Save payload…").clicked()
+                            && let Some(path) = rfd::FileDialog::new().save_file()
+                            && let Err(error) = std::fs::write(&path, &message.payload)
+                        {
+                            *current_error = Some(ActionableError {
+                                message: format!(
+                                    "Could not save payload to {}: {error}",
+                                    path.display()
+                                ),
+                                scope: ErrorScope::General,
+                            });
+                        }
+                        if ui
+                            .button("Use for publish")
+                            .on_hover_text("Populate the publish form without sending")
+                            .clicked()
+                        {
+                            *publish_topic = message.topic.clone();
+                            *publish_qos = message.qos;
+                            *publish_retain = message.retain;
+                            *publish_payload =
+                                String::from_utf8_lossy(&message.payload).into_owned();
                         }
                     });
+                    let pretty_json = format_json(&message.payload);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(payload_view, PayloadView::Text, "Text");
+                        ui.selectable_value(payload_view, PayloadView::Hex, "Hex");
+                        let json_valid = pretty_json.is_some();
+                        ui.add_enabled_ui(json_valid, |ui| {
+                            ui.selectable_value(payload_view, PayloadView::Json, "Pretty JSON");
+                        });
+                        if !json_valid && *payload_view == PayloadView::Json {
+                            *payload_view = PayloadView::Text;
+                        }
+                    });
+                    let payload_text = match payload_view {
+                        PayloadView::Text => std::str::from_utf8(&message.payload)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|_| "Payload is not valid UTF-8. Use Hex.".to_string()),
+                        PayloadView::Hex => format_payload(&message.payload, true),
+                        PayloadView::Json => pretty_json.unwrap_or_default(),
+                    };
+                    egui::ScrollArea::both()
+                        .id_salt(("message_detail", active_id))
+                        .max_height(inspector_height - 80.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut payload_text.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                };
+
+                if ui.available_width() >= 700.0 {
+                    ui.columns(2, |columns| {
+                        list(&mut columns[0]);
+                        detail(&mut columns[1]);
+                    });
+                } else {
+                    list(ui);
+                    ui.separator();
+                    detail(ui);
+                }
+                *selected_message_id = next_selection;
             }
         }
 
@@ -1045,4 +1234,64 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
             app.send_client_command(active_id, command);
         }
     });
+}
+
+#[cfg(test)]
+mod inspector_tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn message(topic: &str, payload: &[u8]) -> ReceivedMessage {
+        ReceivedMessage::new(
+            1,
+            SystemTime::now(),
+            topic.into(),
+            0,
+            false,
+            payload.to_vec(),
+        )
+    }
+
+    #[test]
+    fn filters_topic_and_payload_text() {
+        let message = message("sensors/kitchen/temp", b"warm and dry");
+        assert!(message_matches(
+            &message,
+            "kitchen",
+            MessageFilterMode::Substring,
+            "warm"
+        ));
+        assert!(message_matches(
+            &message,
+            "sensors/+/temp",
+            MessageFilterMode::MqttTopic,
+            "dry"
+        ));
+        assert!(!message_matches(
+            &message,
+            "sensors/+/humidity",
+            MessageFilterMode::MqttTopic,
+            ""
+        ));
+        assert!(!message_matches(
+            &message,
+            "",
+            MessageFilterMode::Substring,
+            "cold"
+        ));
+        assert!(!message_matches(
+            &message,
+            "sensors/#/invalid",
+            MessageFilterMode::MqttTopic,
+            ""
+        ));
+        let binary =
+            ReceivedMessage::new(2, SystemTime::now(), String::new(), 0, false, vec![0xff]);
+        assert!(!message_matches(
+            &binary,
+            "",
+            MessageFilterMode::Substring,
+            "anything"
+        ));
+    }
 }

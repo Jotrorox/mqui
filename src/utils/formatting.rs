@@ -25,3 +25,28 @@ pub(crate) fn format_payload(payload: &[u8], as_hex: bool) -> String {
             .join(" "),
     }
 }
+
+pub(crate) fn format_json(payload: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_json;
+
+    #[test]
+    fn formats_valid_json() {
+        assert_eq!(
+            format_json(br#"{"answer":42}"#).as_deref(),
+            Some("{\n  \"answer\": 42\n}")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_json() {
+        assert!(format_json(b"{broken").is_none());
+        assert!(format_json(&[0xff]).is_none());
+    }
+}

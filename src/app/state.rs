@@ -7,6 +7,19 @@ use crate::models::mqtt::{MqttLoginData, ReceivedMessage, SubscriptionEntry};
 pub(crate) const MAX_ACTIVITY_ITEMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MessageFilterMode {
+    Substring,
+    MqttTopic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PayloadView {
+    Text,
+    Hex,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorScope {
     Connection,
     Subscribe,
@@ -57,9 +70,15 @@ pub(crate) enum TabState {
         publish_qos: u8,
         publish_retain: bool,
         publish_payload: String,
-        payload_view_hex: bool,
+        payload_view: PayloadView,
         topic_filter: String,
+        message_filter_mode: MessageFilterMode,
+        payload_search: String,
         max_messages: usize,
+        capture_paused: bool,
+        paused_message_count: u64,
+        next_message_id: u64,
+        selected_message_id: Option<u64>,
         subscriptions: Vec<SubscriptionEntry>,
         messages: VecDeque<ReceivedMessage>,
         received_count: u64,

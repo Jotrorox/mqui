@@ -286,11 +286,111 @@ pub(crate) struct SubscriptionEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReceivedMessage {
+    pub(crate) id: u64,
     pub(crate) timestamp: SystemTime,
     pub(crate) topic: String,
     pub(crate) qos: u8,
     pub(crate) retain: bool,
     pub(crate) payload: Vec<u8>,
+    /// A bounded, display-ready preview computed once when the message arrives.
+    pub(crate) preview: String,
+}
+
+impl ReceivedMessage {
+    pub(crate) fn new(
+        id: u64,
+        timestamp: SystemTime,
+        topic: String,
+        qos: u8,
+        retain: bool,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            id,
+            timestamp,
+            topic,
+            qos,
+            retain,
+            preview: payload_preview(&payload),
+            payload,
+        }
+    }
+}
+
+fn payload_preview(payload: &[u8]) -> String {
+    const TEXT_CHARS: usize = 80;
+    const HEX_BYTES: usize = 16;
+
+    match std::str::from_utf8(payload) {
+        Ok(text) => {
+            let mut chars = text.chars();
+            let mut preview: String = chars.by_ref().take(TEXT_CHARS).collect();
+            if chars.next().is_some() {
+                preview.push('…');
+            }
+            preview.replace(['\r', '\n'], " ")
+        }
+        Err(_) => {
+            let prefix = &payload[..payload.len().min(HEX_BYTES)];
+            let mut preview = String::with_capacity(prefix.len() * 3 + 2);
+            for (index, byte) in prefix.iter().enumerate() {
+                if index > 0 {
+                    preview.push(' ');
+                }
+                use std::fmt::Write as _;
+                let _ = write!(preview, "{byte:02X}");
+            }
+            if payload.len() > prefix.len() {
+                preview.push_str(" …");
+            }
+            preview
+        }
+    }
+}
+
+pub(crate) fn mqtt_topic_matches(filter: &str, topic: &str) -> bool {
+    let mut levels = filter.split('/').peekable();
+    while let Some(level) = levels.next() {
+        if (level.contains('+') && level != "+")
+            || (level.contains('#') && (level != "#" || levels.peek().is_some()))
+        {
+            return false;
+        }
+    }
+    if topic.starts_with('$') && (filter.starts_with('+') || filter.starts_with('#')) {
+        return false;
+    }
+    let mut filters = filter.split('/');
+    let mut topics = topic.split('/');
+    loop {
+        match (filters.next(), topics.next()) {
+            (Some("#"), _) => return filters.next().is_none(),
+            (Some("+"), Some(_)) => {}
+            (Some(filter_level), Some(topic_level)) if filter_level == topic_level => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::mqtt_topic_matches;
+
+    #[test]
+    fn mqtt_topic_filter_matching() {
+        assert!(mqtt_topic_matches("sensors/+/temp", "sensors/kitchen/temp"));
+        assert!(mqtt_topic_matches("sensors/#", "sensors/kitchen/temp"));
+        assert!(mqtt_topic_matches("#", "anything/at/all"));
+        assert!(mqtt_topic_matches("sport/+", "sport/"));
+        assert!(!mqtt_topic_matches("#", "$SYS/broker/uptime"));
+        assert!(mqtt_topic_matches("$SYS/#", "$SYS/broker/uptime"));
+        assert!(!mqtt_topic_matches("sensors/+/temp", "sensors/temp"));
+        assert!(!mqtt_topic_matches("sensors/#/bad", "sensors/value"));
+        assert!(!mqtt_topic_matches("sensors/te+mp", "sensors/te+mp"));
+        assert!(!mqtt_topic_matches("sensors/#suffix", "sensors/#suffix"));
+        assert!(!mqtt_topic_matches("sensors", "sensors/value"));
+    }
 }
 
 fn resolve_structured_host_and_port(

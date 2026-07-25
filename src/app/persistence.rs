@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::App;
-use super::state::{Tab, TabState};
+use super::state::{MessageFilterMode, PayloadView, Tab, TabState};
 use crate::models::ipc::ConnectionState;
 use crate::models::mqtt::{
     ConnectionInputMode, MqttLoginData, SubscriptionEntry, TlsVerificationMode, TransportKind,
@@ -194,7 +194,7 @@ impl From<&Tab> for PersistedTab {
             publish_qos,
             publish_retain,
             publish_payload,
-            payload_view_hex,
+            payload_view,
             topic_filter,
             max_messages,
             subscriptions,
@@ -212,7 +212,7 @@ impl From<&Tab> for PersistedTab {
                 publish_qos: *publish_qos,
                 publish_retain: *publish_retain,
                 publish_payload: publish_payload.clone(),
-                payload_view_hex: *payload_view_hex,
+                payload_view_hex: *payload_view == PayloadView::Hex,
                 topic_filter: topic_filter.clone(),
                 max_messages: *max_messages,
                 subscriptions: subscriptions
@@ -247,9 +247,19 @@ impl PersistedTab {
                 publish_qos: self.client.publish_qos.min(2),
                 publish_retain: self.client.publish_retain,
                 publish_payload: self.client.publish_payload,
-                payload_view_hex: self.client.payload_view_hex,
+                payload_view: if self.client.payload_view_hex {
+                    PayloadView::Hex
+                } else {
+                    PayloadView::Text
+                },
                 topic_filter: self.client.topic_filter,
+                message_filter_mode: MessageFilterMode::Substring,
+                payload_search: String::new(),
                 max_messages: self.client.max_messages.clamp(1, 1000),
+                capture_paused: false,
+                paused_message_count: 0,
+                next_message_id: 0,
+                selected_message_id: None,
                 subscriptions: self
                     .client
                     .subscriptions
@@ -424,7 +434,7 @@ mod tests {
             publish_qos,
             publish_retain,
             publish_payload,
-            payload_view_hex,
+            payload_view,
             topic_filter,
             max_messages,
             subscriptions,
@@ -436,7 +446,7 @@ mod tests {
         *publish_qos = 2;
         *publish_retain = true;
         *publish_payload = "{\"go\":true}".into();
-        *payload_view_hex = true;
+        *payload_view = PayloadView::Hex;
         *topic_filter = "sensors".into();
         *max_messages = 321;
         subscriptions.push(SubscriptionEntry {
