@@ -16,6 +16,30 @@ use crate::utils::formatting::{format_json, format_payload, format_timestamp};
 
 pub(crate) mod widgets;
 
+const LOGIN_DIALOG_WIDTH: f32 = 520.0;
+const LOGIN_LABEL_WIDTH: f32 = 154.0;
+
+fn form_row(ui: &mut egui::Ui, label: &str, add_control: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [LOGIN_LABEL_WIDTH, 24.0],
+            egui::Label::new(egui::RichText::new(label).color(ui.visuals().weak_text_color()))
+                .sense(egui::Sense::hover()),
+        );
+        add_control(ui);
+    });
+}
+
+fn text_form_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    form_row(ui, label, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(ui.available_width())
+                .margin(egui::Margin::symmetric(8, 6)),
+        );
+    });
+}
+
 fn connection_color(state: ConnectionState, visuals: &egui::Visuals) -> egui::Color32 {
     match state {
         ConnectionState::Connected => egui::Color32::from_rgb(70, 170, 90),
@@ -399,207 +423,264 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         let mut rename_profile = false;
         let mut delete_profile = false;
         let mut export_profile = false;
+        let mut cancel_dialog = false;
 
-        egui::Window::new("MQTT Login")
+        egui::Window::new("New MQTT client")
             .collapsible(false)
             .resizable(false)
+            .default_width(LOGIN_DIALOG_WIDTH)
+            .min_width(LOGIN_DIALOG_WIDTH)
             .open(&mut open)
             .show(&ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+                ui.spacing_mut().button_padding = egui::vec2(12.0, 7.0);
+
                 ui.vertical(|ui| {
-                    if let Some(status) = &app.profile_status {
-                        ui.label(status);
-                    }
-
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut app.mqtt_form.name);
-
-                    egui::CollapsingHeader::new("Connection")
-                        .default_open(true)
+                    let max_form_height = (ctx.content_rect().height() - 180.0).clamp(220.0, 600.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("mqtt_login_form_scroll")
+                        .max_height(max_form_height)
+                        .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Connection mode");
-                                egui::ComboBox::from_id_salt("connection_mode")
-                                    .selected_text(app.mqtt_form.connection_mode.label())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut app.mqtt_form.connection_mode,
-                                            ConnectionInputMode::Structured,
-                                            ConnectionInputMode::Structured.label(),
-                                        );
-                                        ui.selectable_value(
-                                            &mut app.mqtt_form.connection_mode,
-                                            ConnectionInputMode::Url,
-                                            ConnectionInputMode::Url.label(),
-                                        );
+                            ui.set_width(ui.available_width());
+                            if let Some(status) = &app.profile_status {
+                                egui::Frame::new()
+                                    .fill(ui.visuals().widgets.inactive.bg_fill)
+                                    .corner_radius(5.0)
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(status);
                                     });
-                            });
+                            }
 
-                            match app.mqtt_form.connection_mode {
-                                ConnectionInputMode::Structured => {
-                                    ui.label("Broker");
-                                    ui.text_edit_singleline(&mut app.mqtt_form.broker);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Set up a broker connection and save it for later.",
+                                )
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                            ui.add_space(4.0);
+                            text_form_row(ui, "Connection name", &mut app.mqtt_form.name);
+                            ui.add_space(2.0);
 
-                                    ui.label("Port");
-                                    ui.text_edit_singleline(&mut app.mqtt_form.port);
-
-                                    ui.horizontal(|ui| {
-                                        ui.label("Transport");
-                                        egui::ComboBox::from_id_salt("transport_kind")
-                                            .selected_text(app.mqtt_form.transport.label())
+                            egui::CollapsingHeader::new("Connection")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.add_space(4.0);
+                                    form_row(ui, "Connection mode", |ui| {
+                                        egui::ComboBox::from_id_salt("connection_mode")
+                                            .width(ui.available_width())
+                                            .selected_text(app.mqtt_form.connection_mode.label())
                                             .show_ui(ui, |ui| {
-                                                for transport in [
-                                                    TransportKind::Tcp,
-                                                    TransportKind::Tls,
-                                                    TransportKind::Ws,
-                                                    TransportKind::Wss,
-                                                ] {
-                                                    ui.selectable_value(
-                                                        &mut app.mqtt_form.transport,
-                                                        transport,
-                                                        transport.label(),
-                                                    );
-                                                }
+                                                ui.selectable_value(
+                                                    &mut app.mqtt_form.connection_mode,
+                                                    ConnectionInputMode::Structured,
+                                                    ConnectionInputMode::Structured.label(),
+                                                );
+                                                ui.selectable_value(
+                                                    &mut app.mqtt_form.connection_mode,
+                                                    ConnectionInputMode::Url,
+                                                    ConnectionInputMode::Url.label(),
+                                                );
                                             });
                                     });
 
-                                    if app.mqtt_form.transport.uses_websocket() {
-                                        ui.label("WebSocket path");
-                                        ui.text_edit_singleline(&mut app.mqtt_form.ws_path);
-                                    }
-                                }
-                                ConnectionInputMode::Url => {
-                                    ui.label("Connection URL");
-                                    ui.text_edit_singleline(&mut app.mqtt_form.connection_url);
+                                    match app.mqtt_form.connection_mode {
+                                        ConnectionInputMode::Structured => {
+                                            text_form_row(ui, "Broker", &mut app.mqtt_form.broker);
+                                            text_form_row(ui, "Port", &mut app.mqtt_form.port);
 
-                                    if !app.mqtt_form.connection_url.trim().is_empty()
-                                        && let Err(err) = app.mqtt_form.resolve_connection()
-                                    {
-                                        ui.colored_label(ui.visuals().warn_fg_color, err);
-                                    }
-                                }
-                            }
+                                            form_row(ui, "Transport", |ui| {
+                                                egui::ComboBox::from_id_salt("transport_kind")
+                                                    .width(ui.available_width())
+                                                    .selected_text(app.mqtt_form.transport.label())
+                                                    .show_ui(ui, |ui| {
+                                                        for transport in [
+                                                            TransportKind::Tcp,
+                                                            TransportKind::Tls,
+                                                            TransportKind::Ws,
+                                                            TransportKind::Wss,
+                                                        ] {
+                                                            ui.selectable_value(
+                                                                &mut app.mqtt_form.transport,
+                                                                transport,
+                                                                transport.label(),
+                                                            );
+                                                        }
+                                                    });
+                                            });
 
-                            let active_transport = match app.mqtt_form.connection_mode {
-                                ConnectionInputMode::Structured => Some(app.mqtt_form.transport),
-                                ConnectionInputMode::Url => app
-                                    .mqtt_form
-                                    .resolve_connection()
-                                    .ok()
-                                    .map(|resolved| resolved.transport),
-                            };
-
-                            if matches!(
-                                active_transport,
-                                Some(TransportKind::Tls | TransportKind::Wss)
-                            ) {
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("TLS verification");
-                                    egui::ComboBox::from_id_salt("tls_verification")
-                                        .selected_text(app.mqtt_form.tls_verification.label())
-                                        .show_ui(ui, |ui| {
-                                            for mode in [
-                                                TlsVerificationMode::SystemRoots,
-                                                TlsVerificationMode::CustomCa,
-                                                TlsVerificationMode::InsecureSkipVerify,
-                                            ] {
-                                                ui.selectable_value(
-                                                    &mut app.mqtt_form.tls_verification,
-                                                    mode,
-                                                    mode.label(),
+                                            if app.mqtt_form.transport.uses_websocket() {
+                                                text_form_row(
+                                                    ui,
+                                                    "WebSocket path",
+                                                    &mut app.mqtt_form.ws_path,
                                                 );
                                             }
-                                        });
-                                });
-
-                                if app.mqtt_form.tls_verification == TlsVerificationMode::CustomCa {
-                                    ui.label("CA PEM file");
-                                    ui.horizontal(|ui| {
-                                        ui.text_edit_singleline(
-                                            &mut app.mqtt_form.tls_ca_cert_path,
-                                        );
-                                        if ui.button("Browse...").clicked()
-                                            && let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("PEM", &["pem", "crt", "cer"])
-                                                .pick_file()
-                                        {
-                                            app.mqtt_form.tls_ca_cert_path =
-                                                path.display().to_string();
                                         }
-                                    });
-                                }
+                                        ConnectionInputMode::Url => {
+                                            text_form_row(
+                                                ui,
+                                                "Connection URL",
+                                                &mut app.mqtt_form.connection_url,
+                                            );
 
-                                if app.mqtt_form.tls_verification
-                                    == TlsVerificationMode::InsecureSkipVerify
-                                {
-                                    ui.colored_label(
+                                            if !app.mqtt_form.connection_url.trim().is_empty()
+                                                && let Err(err) = app.mqtt_form.resolve_connection()
+                                            {
+                                                ui.colored_label(ui.visuals().warn_fg_color, err);
+                                            }
+                                        }
+                                    }
+
+                                    let active_transport = match app.mqtt_form.connection_mode {
+                                        ConnectionInputMode::Structured => {
+                                            Some(app.mqtt_form.transport)
+                                        }
+                                        ConnectionInputMode::Url => app
+                                            .mqtt_form
+                                            .resolve_connection()
+                                            .ok()
+                                            .map(|resolved| resolved.transport),
+                                    };
+
+                                    if matches!(
+                                        active_transport,
+                                        Some(TransportKind::Tls | TransportKind::Wss)
+                                    ) {
+                                        ui.separator();
+                                        form_row(ui, "TLS verification", |ui| {
+                                            egui::ComboBox::from_id_salt("tls_verification")
+                                                .width(ui.available_width())
+                                                .selected_text(
+                                                    app.mqtt_form.tls_verification.label(),
+                                                )
+                                                .show_ui(ui, |ui| {
+                                                    for mode in [
+                                                        TlsVerificationMode::SystemRoots,
+                                                        TlsVerificationMode::CustomCa,
+                                                        TlsVerificationMode::InsecureSkipVerify,
+                                                    ] {
+                                                        ui.selectable_value(
+                                                            &mut app.mqtt_form.tls_verification,
+                                                            mode,
+                                                            mode.label(),
+                                                        );
+                                                    }
+                                                });
+                                        });
+
+                                        if app.mqtt_form.tls_verification
+                                            == TlsVerificationMode::CustomCa
+                                        {
+                                            form_row(ui, "CA certificate", |ui| {
+                                                ui.add(
+                                                    egui::TextEdit::singleline(
+                                                        &mut app.mqtt_form.tls_ca_cert_path,
+                                                    )
+                                                    .desired_width(ui.available_width() - 88.0),
+                                                );
+                                                if ui.button("Browse...").clicked()
+                                                    && let Some(path) = rfd::FileDialog::new()
+                                                        .add_filter("PEM", &["pem", "crt", "cer"])
+                                                        .pick_file()
+                                                {
+                                                    app.mqtt_form.tls_ca_cert_path =
+                                                        path.display().to_string();
+                                                }
+                                            });
+                                        }
+
+                                        if app.mqtt_form.tls_verification
+                                            == TlsVerificationMode::InsecureSkipVerify
+                                        {
+                                            ui.colored_label(
                                         ui.visuals().warn_fg_color,
                                         "Certificate verification is disabled for this connection.",
                                     );
-                                }
-                            }
+                                        }
+                                    }
 
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.label("Keep alive (seconds)");
-                                ui.add(
-                                    egui::DragValue::new(&mut app.mqtt_form.keep_alive_secs)
-                                        .range(1..=u16::MAX),
-                                );
-                            });
-                            ui.checkbox(
-                                &mut app.mqtt_form.automatic_reconnect,
-                                "Automatically reconnect",
-                            );
-                            if app.mqtt_form.automatic_reconnect {
-                                ui.horizontal(|ui| {
-                                    ui.label("Maximum reconnect delay (seconds)");
-                                    ui.add(
-                                        egui::DragValue::new(
-                                            &mut app.mqtt_form.reconnect_max_delay_secs,
-                                        )
-                                        .range(1..=u16::MAX),
+                                    ui.separator();
+                                    form_row(ui, "Keep alive", |ui| {
+                                        ui.add(
+                                            egui::DragValue::new(
+                                                &mut app.mqtt_form.keep_alive_secs,
+                                            )
+                                            .range(1..=u16::MAX),
+                                        );
+                                        ui.weak("seconds");
+                                    });
+                                    form_row(ui, "Reconnect", |ui| {
+                                        ui.checkbox(
+                                            &mut app.mqtt_form.automatic_reconnect,
+                                            "Automatically reconnect",
+                                        );
+                                    });
+                                    if app.mqtt_form.automatic_reconnect {
+                                        form_row(ui, "Maximum delay", |ui| {
+                                            ui.add(
+                                                egui::DragValue::new(
+                                                    &mut app.mqtt_form.reconnect_max_delay_secs,
+                                                )
+                                                .range(1..=u16::MAX),
+                                            );
+                                            ui.weak("seconds");
+                                        });
+                                    }
+
+                                    text_form_row(
+                                        ui,
+                                        "Client ID (optional)",
+                                        &mut app.mqtt_form.client_id,
                                     );
+                                    ui.add_space(2.0);
                                 });
-                            }
 
-                            ui.label("Client ID (optional)");
-                            ui.text_edit_singleline(&mut app.mqtt_form.client_id);
+                            egui::CollapsingHeader::new("Login credentials")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.add_space(4.0);
+                                    text_form_row(ui, "Username", &mut app.mqtt_form.username);
+                                    form_row(ui, "Password", |ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut app.mqtt_form.password)
+                                                .password(true)
+                                                .desired_width(ui.available_width())
+                                                .margin(egui::Margin::symmetric(8, 6)),
+                                        );
+                                    });
+                                    ui.add_space(2.0);
+                                });
+
+                            egui::CollapsingHeader::new("Testament")
+                                .default_open(false)
+                                .show(ui, |ui| {
+                                    ui.add_space(4.0);
+                                    text_form_row(ui, "Topic", &mut app.mqtt_form.testament_topic);
+
+                                    form_row(ui, "Delivery", |ui| {
+                                        ui.weak("QoS");
+                                        ui.add(
+                                            egui::DragValue::new(&mut app.mqtt_form.testament_qos)
+                                                .range(0..=2),
+                                        );
+                                        ui.checkbox(&mut app.mqtt_form.testament_retain, "Retain");
+                                    });
+
+                                    text_form_row(
+                                        ui,
+                                        "Last-will message",
+                                        &mut app.mqtt_form.testament_and_last_will,
+                                    );
+                                    ui.add_space(2.0);
+                                });
                         });
 
-                    egui::CollapsingHeader::new("Login credentials")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label("Username (optional)");
-                            ui.text_edit_singleline(&mut app.mqtt_form.username);
-
-                            ui.label("Password (optional)");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut app.mqtt_form.password)
-                                    .password(true),
-                            );
-                        });
-
-                    egui::CollapsingHeader::new("Testament")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            ui.label("Topic (optional)");
-                            ui.text_edit_singleline(&mut app.mqtt_form.testament_topic);
-
-                            ui.horizontal(|ui| {
-                                ui.label("QoS");
-                                ui.add(
-                                    egui::DragValue::new(&mut app.mqtt_form.testament_qos)
-                                        .range(0..=2),
-                                );
-                                ui.checkbox(&mut app.mqtt_form.testament_retain, "Retain");
-                            });
-
-                            ui.label("testament and last will");
-                            ui.text_edit_singleline(&mut app.mqtt_form.testament_and_last_will);
-                        });
-
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         let selected_profile_text = app
                             .selected_profile_id
@@ -607,20 +688,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             .and_then(|id| app.profile_entries.iter().find(|entry| &entry.id == id))
                             .map_or("Load configuration", |entry| entry.display_name.as_str());
 
-                        if ui.button("Save as new").clicked() {
-                            save_profile = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                app.selected_profile_id.is_some(),
-                                egui::Button::new("Overwrite"),
-                            )
-                            .clicked()
-                        {
-                            request_overwrite = true;
-                        }
-
                         egui::ComboBox::from_id_salt("mqtt_config_picker")
+                            .width(190.0)
                             .selected_text(selected_profile_text)
                             .show_ui(ui, |ui| {
                                 for entry in &app.profile_entries {
@@ -652,9 +721,22 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                     ui.close();
                                 }
                             });
+                        if ui.button("Save as new").clicked() {
+                            save_profile = true;
+                        }
 
-                        ui.menu_button("Profile actions", |ui| {
+                        ui.menu_button("Manage", |ui| {
                             let selected = app.selected_profile_id.is_some();
+                            if ui
+                                .add_enabled(
+                                    selected,
+                                    egui::Button::new("Overwrite selected profile"),
+                                )
+                                .clicked()
+                            {
+                                request_overwrite = true;
+                                ui.close();
+                            }
                             if ui
                                 .add_enabled(selected, egui::Button::new("Rename..."))
                                 .clicked()
@@ -677,14 +759,30 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                                 ui.close();
                             }
                         });
+                    });
 
-                        if ui.button("Add client").clicked() {
+                    ui.add_space(4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let primary = egui::Button::new(
+                            egui::RichText::new("Add client")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(ui.visuals().selection.bg_fill)
+                        .min_size(egui::vec2(108.0, 32.0));
+                        if ui.add(primary).clicked() {
                             create_client = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_dialog = true;
                         }
                     });
                 });
             });
 
+        if cancel_dialog {
+            open = false;
+        }
         if save_profile {
             app.save_current_profile(false);
         }
@@ -819,9 +917,13 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
         let mut force_disconnect_clicked = false;
         let mut reconnect_clicked = false;
         let mut cancel_reconnect_clicked = false;
+        let main_viewport_height = ui.available_height();
 
-        match &mut tab.state {
-            TabState::Client {
+        egui::ScrollArea::vertical()
+            .id_salt(("main_workspace_scroll", active_id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| match &mut tab.state {
+                TabState::Client {
                 mqtt_login,
                 connection_state,
                 current_error,
@@ -850,7 +952,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 dropped_message_count,
                 published_count,
                 ..
-            } => {
+                } => {
                 ui.heading("MQTT Client");
                 ui.label(format!("Broker / transport: {}", mqtt_login.display_connection_label()));
                 let status_color = connection_color(*connection_state, ui.visuals());
@@ -927,25 +1029,39 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     egui::CollapsingHeader::new(format!("Recent activity ({})", activity.len()))
                         .default_open(true)
                         .show(ui, |ui| {
-                            for item in activity.iter() {
-                                let (label, color) = match item.level {
-                                    ActivityLevel::Info => ("Info", ui.visuals().text_color()),
-                                    ActivityLevel::Success => {
-                                        ("Success", egui::Color32::from_rgb(70, 170, 90))
-                                    }
-                                    ActivityLevel::Warning => {
-                                        ("Warning", ui.visuals().warn_fg_color)
-                                    }
-                                };
-                                ui.colored_label(
-                                    color,
-                                    format!(
-                                        "{} · {label}: {}",
-                                        format_timestamp(item.timestamp),
-                                        item.message
-                                    ),
-                                );
-                            }
+                            egui::Frame::group(ui.style())
+                                .inner_margin(egui::Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("recent_activity_scroll", active_id))
+                                        .max_height(140.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            for item in activity.iter() {
+                                                let (label, color) = match item.level {
+                                                    ActivityLevel::Info => {
+                                                        ("Info", ui.visuals().text_color())
+                                                    }
+                                                    ActivityLevel::Success => (
+                                                        "Success",
+                                                        egui::Color32::from_rgb(70, 170, 90),
+                                                    ),
+                                                    ActivityLevel::Warning => {
+                                                        ("Warning", ui.visuals().warn_fg_color)
+                                                    }
+                                                };
+                                                ui.colored_label(
+                                                    color,
+                                                    format!(
+                                                        "{} · {label}: {}",
+                                                        format_timestamp(item.timestamp),
+                                                        item.message
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                });
                         });
                 }
                 ui.label(format!(
@@ -1232,7 +1348,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         .on_hover_text("Searches UTF-8 payloads only");
                 });
 
-                let inspector_height = ui.available_height().max(220.0);
+                let inspector_height = (main_viewport_height - 160.0).max(220.0);
                 let selected_for_frame = *selected_message_id;
                 let mut next_selection = selected_for_frame;
                 let mut list = |ui: &mut egui::Ui| {
@@ -1375,8 +1491,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     detail(ui);
                 }
                 *selected_message_id = next_selection;
-            }
-        }
+                }
+            });
 
         for command in commands_to_send {
             app.send_client_command(active_id, command);

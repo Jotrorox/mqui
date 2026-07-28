@@ -477,6 +477,13 @@ fn spawn_client_inner(
             let _ = event_tx.send(ClientEvent::Disconnected(format!("Attach failed: {err}")));
             return;
         }
+        if let Err(err) = endpoint.set_auto_pub_response(false).await {
+            let _ = event_tx.send(ClientEvent::Disconnected(format!(
+                "Failed to configure publish acknowledgement handling: {err}"
+            )));
+            let _ = endpoint.close().await;
+            return;
+        }
 
         let mut connect_builder = match mqtt_ep::packet::v5_0::Connect::builder().client_id(&client_id) {
             Ok(builder) => builder.keep_alive(keep_alive_secs).clean_start(true),
