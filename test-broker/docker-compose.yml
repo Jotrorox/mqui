@@ -1,6 +1,7 @@
 services:
   mosquitto:
-    image: eclipse-mosquitto:2.0.22
+    build:
+      context: .
     user: "0:0"
     entrypoint: ["/test/entrypoint.sh"]
     ports:
