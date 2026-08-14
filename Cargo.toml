@@ -6,7 +6,7 @@ license = "MIT"
 repository = "https://github.com/jotrorox/mqui"
 
 [dependencies]
-eframe = "0.35.0"
+eframe = "0.36.1"
 egui = "0.35.0"
 mqtt-endpoint-tokio = "0.6.5"
 mimalloc = { version = "0.1.52", features = ["secure"] }
