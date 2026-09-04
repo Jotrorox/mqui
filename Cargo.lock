@@ -2199,9 +2199,9 @@ dependencies = [
 
 [[package]]
 name = "mqtt-endpoint-tokio"
-version = "0.6.5"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9541bbf805d9cc9139dfc4ce6f9178f2f8de12970ab33f4a867816bac0e44f64"
+checksum = "eb8499f1537ffe40594e40c95d970223bdc8046342f2128dccf9ded41ac200b3"
 dependencies = [
  "derive_builder",
  "futures",
@@ -2222,9 +2222,9 @@ dependencies = [
 
 [[package]]
 name = "mqtt-protocol-core"
-version = "0.7.8"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d970f7f9c2f4e3813d75c43e360b785e3ba3748ef9da172dd41c81a8c20e9e4"
+checksum = "dfc15d368afc375a611d34fcb1e668507efecd7ee3dcf48c73e7e9d8472f6934"
 dependencies = [
  "arrayvec",
  "delegate",
