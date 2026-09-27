@@ -166,12 +166,12 @@ impl MqttLoginData {
     }
 
     pub(crate) fn username_opt(&self) -> Option<&str> {
-        let value = self.username.trim();
+        let value = self.username.as_str();
         if value.is_empty() { None } else { Some(value) }
     }
 
     pub(crate) fn password_opt(&self) -> Option<&str> {
-        let value = self.password.trim();
+        let value = self.password.as_str();
         if value.is_empty() { None } else { Some(value) }
     }
 
@@ -278,6 +278,26 @@ impl MqttLoginData {
     }
 }
 
+/// Remove URL userinfo before persisting connection settings, even for invalid URLs.
+pub(crate) fn sanitize_connection_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(mut url) = Url::parse(trimmed) {
+        if !url.username().is_empty() || url.password().is_some() {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+        }
+        return url.to_string();
+    }
+    // A malformed URL is not connectable; discard an authority containing userinfo
+    // rather than risk writing a credential-shaped value to disk.
+    if let Some((scheme, rest)) = trimmed.split_once("://")
+        && let Some(at) = rest.rfind('@')
+    {
+        return format!("{scheme}://{}", &rest[at + 1..]);
+    }
+    trimmed.to_string()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SubscriptionEntry {
     pub(crate) topic: String,
@@ -297,6 +317,13 @@ pub(crate) struct ReceivedMessage {
 }
 
 impl ReceivedMessage {
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.topic.capacity()
+            + self.payload.capacity()
+            + self.preview.capacity()
+    }
+
     pub(crate) fn new(
         id: u64,
         timestamp: SystemTime,
@@ -528,7 +555,56 @@ fn build_display_label(
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind};
+    use super::{
+        ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind,
+        sanitize_connection_url,
+    };
+
+    #[test]
+    fn credentials_preserve_whitespace_and_utf8_bytes() {
+        for value in [" secret ", " \t\r\n", "\u{a0}pässword\u{a0}", "a\0b"] {
+            let login = MqttLoginData {
+                username: value.into(),
+                password: value.into(),
+                ..Default::default()
+            };
+            assert_eq!(login.password_opt().unwrap().as_bytes(), value.as_bytes());
+            assert_eq!(login.username_opt().unwrap().as_bytes(), value.as_bytes());
+        }
+        let empty = MqttLoginData::default();
+        assert_eq!(empty.password_opt(), None);
+        assert_eq!(empty.username_opt(), None);
+    }
+
+    #[test]
+    fn persisted_urls_remove_userinfo_and_preserve_endpoints() {
+        for (raw, expected) in [
+            ("", ""),
+            (
+                "  mqtt://broker.example:1883  ",
+                "mqtt://broker.example:1883",
+            ),
+            (
+                "mqtt://alice:secret@broker.example:1883",
+                "mqtt://broker.example:1883",
+            ),
+            ("mqtts://alice@broker.example", "mqtts://broker.example"),
+            (
+                "ws://:secret@broker.example/mqtt",
+                "ws://broker.example/mqtt",
+            ),
+            (
+                "wss://al%40ice:s%40cret@[::1]:8883/mqtt",
+                "wss://[::1]:8883/mqtt",
+            ),
+            (
+                "mqtt://alice:secret@broker.example:invalid",
+                "mqtt://broker.example:invalid",
+            ),
+        ] {
+            assert_eq!(sanitize_connection_url(raw), expected);
+        }
+    }
 
     fn default_login() -> MqttLoginData {
         MqttLoginData::default()

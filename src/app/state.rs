@@ -3,6 +3,7 @@ use std::time::SystemTime;
 
 use crate::models::ipc::ConnectionState;
 use crate::models::mqtt::{MqttLoginData, ReceivedMessage, SubscriptionEntry};
+use crate::models::payload::PublishEncoding;
 
 pub(crate) const MAX_ACTIVITY_ITEMS: usize = 8;
 
@@ -70,6 +71,7 @@ pub(crate) enum TabState {
         publish_qos: u8,
         publish_retain: bool,
         publish_payload: String,
+        publish_encoding: PublishEncoding,
         payload_view: PayloadView,
         topic_filter: String,
         message_filter_mode: MessageFilterMode,
@@ -81,6 +83,7 @@ pub(crate) enum TabState {
         selected_message_id: Option<u64>,
         subscriptions: Vec<SubscriptionEntry>,
         messages: VecDeque<ReceivedMessage>,
+        history_bytes: usize,
         received_count: u64,
         dropped_message_count: u64,
         current_client_dropped_message_count: u64,

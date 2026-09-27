@@ -26,6 +26,7 @@ pub(crate) enum ClientCommandResult {
     ClientTaskFinished,
     ChannelFull,
     ChannelClosed,
+    PacketTooLarge,
 }
 
 impl ClientCommandResult {
@@ -36,7 +37,12 @@ impl ClientCommandResult {
             Self::ClientTaskFinished => {
                 Some("The client task has finished; reconnect and try again.")
             }
-            Self::ChannelFull => Some("The client command queue is full; wait and try again."),
+            Self::ChannelFull => Some(
+                "The command queue or byte budget is full; reduce the payload or wait and try again.",
+            ),
+            Self::PacketTooLarge => {
+                Some("Command exceeds the 256 KiB packet limit; reduce its payload or topic.")
+            }
             Self::ChannelClosed => {
                 Some("The client command channel is closed; reconnect and try again.")
             }
@@ -46,6 +52,7 @@ impl ClientCommandResult {
 
 pub struct App {
     pub(crate) next_tab_id: u64,
+    pub(crate) event_tab_cursor: usize,
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active_tab: Option<u64>,
     pub(crate) show_mqtt_popup: bool,
@@ -69,6 +76,7 @@ pub struct App {
     pub(crate) connection_states: HashMap<u64, ConnectionState>,
     pub(crate) workspace_warning: Option<String>,
     workspace_path: Option<std::path::PathBuf>,
+    workspace_save_blocked: bool,
     workspace_snapshot: Vec<u8>,
     workspace_dirty_since: Option<Instant>,
     restored_connections_pending: Vec<u64>,
@@ -76,6 +84,12 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
+        Self::with_workspace_path(persistence::workspace_path().ok())
+    }
+}
+
+impl App {
+    fn with_workspace_path(workspace_path: Option<std::path::PathBuf>) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -83,6 +97,7 @@ impl Default for App {
 
         let mut app = Self {
             next_tab_id: 0,
+            event_tab_cursor: 0,
             tabs: Vec::new(),
             active_tab: None,
             show_mqtt_popup: false,
@@ -105,7 +120,8 @@ impl Default for App {
             manually_disconnected: HashSet::new(),
             connection_states: HashMap::new(),
             workspace_warning: None,
-            workspace_path: persistence::workspace_path().ok(),
+            workspace_path,
+            workspace_save_blocked: false,
             workspace_snapshot: Vec::new(),
             workspace_dirty_since: None,
             restored_connections_pending: Vec::new(),
@@ -140,16 +156,23 @@ impl App {
             }
             Ok(None) => {}
             Err(err) => {
+                self.workspace_save_blocked = true;
                 self.workspace_warning = Some(format!(
-                    "Could not restore workspace from {}: {err}",
+                    "Could not restore workspace from {}: {err}. Saving is disabled to protect the original file.",
                     path.display()
                 ));
+                return;
             }
         }
         self.workspace_snapshot = persistence::serialize(self).unwrap_or_default();
     }
 
     fn save_workspace(&mut self, force: bool) {
+        // This guard covers autosave, eframe's save hook, and Drop, independently
+        // of whether the warning is visible.
+        if self.workspace_save_blocked {
+            return;
+        }
         let Some(path) = self.workspace_path.as_deref() else {
             return;
         };
@@ -173,6 +196,45 @@ impl App {
                         path.display()
                     ));
                 }
+            }
+        }
+    }
+
+    pub(crate) fn workspace_save_blocked(&self) -> bool {
+        self.workspace_save_blocked
+    }
+
+    pub(crate) fn recover_workspace(&mut self) {
+        if !self.workspace_save_blocked {
+            return;
+        }
+        let Some(path) = self.workspace_path.as_deref() else {
+            return;
+        };
+        let result = (|| {
+            let snapshot = persistence::serialize(self).map_err(|err| err.to_string())?;
+            let backup = persistence::backup_workspace(path)
+                .map_err(|err| format!("Could not back up {}: {err}", path.display()))?;
+            persistence::atomic_write(path, &snapshot).map_err(|err| {
+                format!(
+                    "Original backed up to {}, but could not save workspace: {err}",
+                    backup.display()
+                )
+            })?;
+            Ok::<_, String>((snapshot, backup))
+        })();
+        match result {
+            Ok((snapshot, backup)) => {
+                self.workspace_snapshot = snapshot;
+                self.workspace_dirty_since = None;
+                self.workspace_save_blocked = false;
+                self.workspace_warning = Some(format!(
+                    "Original workspace backed up to {}. Saving is enabled.",
+                    backup.display()
+                ));
+            }
+            Err(err) => {
+                self.workspace_warning = Some(format!("{err}. Saving remains disabled."));
             }
         }
     }
@@ -223,6 +285,7 @@ impl App {
                         publish_qos: 0,
                         publish_retain: false,
                         publish_payload: "hello".to_string(),
+                        publish_encoding: crate::models::payload::PublishEncoding::Text,
                         payload_view: PayloadView::Text,
                         topic_filter: "".to_string(),
                         message_filter_mode: MessageFilterMode::Substring,
@@ -234,6 +297,7 @@ impl App {
                         selected_message_id: None,
                         subscriptions: Vec::new(),
                         messages: VecDeque::new(),
+                        history_bytes: 0,
                         received_count: 0,
                         dropped_message_count: 0,
                         current_client_dropped_message_count: 0,
@@ -422,6 +486,9 @@ impl App {
             None => ClientCommandResult::NoClientHandle,
             Some(client) if client.join_handle.is_finished() => {
                 ClientCommandResult::ClientTaskFinished
+            }
+            Some(_) if command.packet_bytes() > crate::models::limits::MAX_PACKET_BYTES => {
+                ClientCommandResult::PacketTooLarge
             }
             Some(client) => match client.command_tx.try_send(command) {
                 Ok(()) => ClientCommandResult::Accepted,
@@ -646,12 +713,22 @@ impl App {
     }
 
     fn maintain_clients(&mut self) {
+        // Snapshot completion before draining: these tasks cannot enqueue any
+        // more events. Tasks finishing during the drain stay until the next frame.
         let finished: Vec<u64> = self
             .clients
             .iter()
             .filter_map(|(id, handle)| handle.join_handle.is_finished().then_some(*id))
             .collect();
+        events::pump_client_events(self);
         for id in finished {
+            if self
+                .clients
+                .get(&id)
+                .is_some_and(|client| !client.events_drained())
+            {
+                continue;
+            }
             self.clients.remove(&id);
             let Some((enabled, maximum)) = self.tabs.iter().find_map(|tab| {
                 (tab.id == id).then(|| match &tab.state {
@@ -717,7 +794,6 @@ impl eframe::App for App {
             self.start_client(id);
         }
         self.maintain_clients();
-        events::pump_client_events(self);
         crate::ui::render(self, ui);
         self.save_workspace(false);
         if let Some(since) = self.workspace_dirty_since {
@@ -757,7 +833,8 @@ mod tests {
     use crate::models::client::ClientHandle;
 
     fn empty_app() -> App {
-        let mut app = App::default();
+        let mut app = App::with_workspace_path(None);
+        app.restored_connections_pending.clear();
         app.stop_all_clients();
         app.tabs.clear();
         app.clients.clear();
@@ -766,6 +843,347 @@ mod tests {
         app.reconnect_deadlines.clear();
         app.manually_disconnected.clear();
         app
+    }
+
+    const TEST_WORKSPACE: &str = "version = 1\n[[tabs]]\nid = 7\ntitle = 'Saved tab'\n";
+
+    fn add_workspace_test_tab(app: &mut App) {
+        app.tabs = toml::from_str::<persistence::Workspace>(TEST_WORKSPACE)
+            .unwrap()
+            .restore()
+            .tabs;
+    }
+
+    #[test]
+    fn workspace_load_failure_blocks_autosave_forced_save_and_shutdown() {
+        for original in [
+            b"tabs = [ definitely not toml".as_slice(),
+            b"version = 4294967295\n[[tabs]]\nid = 7\ntitle = 'Future tab'\n",
+            b"\xff\xfe",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("workspace.toml");
+            std::fs::write(&path, original).unwrap();
+            let mut app = App::with_workspace_path(Some(path.clone()));
+            assert!(app.workspace_save_blocked());
+            assert!(
+                app.workspace_warning
+                    .as_deref()
+                    .unwrap()
+                    .contains("Saving is disabled")
+            );
+            // Warning visibility must never control whether writes are allowed.
+            app.workspace_warning = None;
+            add_workspace_test_tab(&mut app);
+            app.workspace_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+            app.save_workspace(false);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            app.save_workspace(true);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            drop(app);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn workspace_recovery_preserves_original_and_resumes_saving() {
+        for original in ["invalid TOML [", "version = 4294967295"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("workspace.toml");
+            std::fs::write(&path, original).unwrap();
+            let mut app = App::with_workspace_path(Some(path.clone()));
+            add_workspace_test_tab(&mut app);
+            app.recover_workspace();
+            assert!(!app.workspace_save_blocked());
+            let backup = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|candidate| candidate != &path)
+                .unwrap();
+            assert_eq!(std::fs::read(&backup).unwrap(), original.as_bytes());
+            assert!(
+                app.workspace_warning
+                    .as_deref()
+                    .unwrap()
+                    .contains(&*backup.to_string_lossy())
+            );
+            assert_eq!(
+                persistence::load(&path).unwrap().unwrap().restore().tabs[0].title,
+                "Saved tab"
+            );
+            app.tabs[0].title = "Autosaved tab".into();
+            app.workspace_dirty_since = Some(Instant::now() - Duration::from_secs(1));
+            app.save_workspace(false);
+            assert_eq!(
+                persistence::load(&path).unwrap().unwrap().restore().tabs[0].title,
+                "Autosaved tab"
+            );
+            app.tabs[0].title = "Saved on shutdown".into();
+            drop(app);
+            assert_eq!(
+                persistence::load(&path).unwrap().unwrap().restore().tabs[0].title,
+                "Saved on shutdown"
+            );
+            assert_eq!(std::fs::read(&backup).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn workspace_read_and_recovery_errors_keep_saving_blocked_until_recovery_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.toml");
+        // A directory gives a portable read failure, even when tests run as root.
+        std::fs::create_dir(&path).unwrap();
+        let mut app = App::with_workspace_path(Some(path.clone()));
+        assert!(app.workspace_save_blocked());
+        app.recover_workspace();
+        assert!(app.workspace_save_blocked());
+        assert!(
+            app.workspace_warning
+                .as_deref()
+                .unwrap()
+                .contains("Saving remains disabled")
+        );
+        assert!(path.is_dir());
+
+        std::fs::remove_dir(&path).unwrap();
+        app.recover_workspace();
+        assert!(app.workspace_save_blocked());
+        app.save_workspace(true);
+        assert!(!path.exists());
+
+        std::fs::write(&path, "original bytes").unwrap();
+        app.save_workspace(true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original bytes");
+        app.recover_workspace();
+        assert!(!app.workspace_save_blocked());
+        assert!(persistence::load(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn workspace_missing_or_valid_file_allows_normal_saving() {
+        for original in [None, Some(TEST_WORKSPACE)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("workspace.toml");
+            if let Some(original) = original {
+                std::fs::write(&path, original).unwrap();
+            }
+            let mut app = App::with_workspace_path(Some(path.clone()));
+            assert!(!app.workspace_save_blocked());
+            assert!(app.workspace_warning.is_none());
+            if original.is_some() {
+                assert_eq!(app.tabs[0].title, "Saved tab");
+            } else {
+                add_workspace_test_tab(&mut app);
+            }
+            app.tabs[0].title = "Updated tab".into();
+            drop(app);
+            assert_eq!(
+                persistence::load(&path).unwrap().unwrap().restore().tabs[0].title,
+                "Updated tab"
+            );
+        }
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "client lifecycle timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn reply_to_connect(
+        app: &App,
+        listener: &tokio::net::TcpListener,
+        reason_code: u8,
+    ) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        app.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert_eq!(stream.read_u8().await.unwrap(), 0x10); // CONNECT
+                let mut length = 0;
+                let mut multiplier = 1;
+                loop {
+                    let byte = stream.read_u8().await.unwrap();
+                    length += usize::from(byte & 0x7f) * multiplier;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                    multiplier *= 128;
+                    assert!(multiplier <= 128 * 128 * 128);
+                }
+                stream.read_exact(&mut vec![0; length]).await.unwrap();
+                // MQTT 5 CONNACK, with no session or properties.
+                stream
+                    .write_all(&[0x20, 0x03, 0, reason_code, 0])
+                    .await
+                    .unwrap();
+                stream
+            })
+            .await
+            .expect("broker handshake timed out")
+        })
+    }
+
+    fn assert_tab_state(app: &App, id: u64, expected: ConnectionState, error: Option<&str>) {
+        assert_eq!(app.connection_states.get(&id), Some(&expected));
+        let TabState::Client {
+            connection_state,
+            current_error,
+            ..
+        } = &app.tabs.iter().find(|tab| tab.id == id).unwrap().state;
+        assert_eq!(*connection_state, expected);
+        assert_eq!(
+            current_error.as_ref().map(|error| error.message.as_str()),
+            error
+        );
+        if let Some(error) = current_error {
+            assert_eq!(error.scope, ErrorScope::Connection);
+        }
+    }
+
+    #[test]
+    fn finished_client_failure_is_preserved_through_app_lifecycle() {
+        for automatic_reconnect in [false, true] {
+            let mut app = empty_app();
+            let listener = app
+                .runtime
+                .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
+            app.new_tab(
+                TabKind::Client,
+                MqttLoginData {
+                    broker: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port().to_string(),
+                    automatic_reconnect,
+                    ..MqttLoginData::default()
+                },
+            );
+            let id = app.active_tab.unwrap();
+            let _rejected = reply_to_connect(&app, &listener, 0x86);
+            // Leave every event queued until the real client task has exited.
+            wait_until(|| app.clients[&id].join_handle.is_finished());
+            app.maintain_clients();
+
+            let expected = if automatic_reconnect {
+                ConnectionState::Reconnecting
+            } else {
+                ConnectionState::Failed
+            };
+            assert_tab_state(
+                &app,
+                id,
+                expected,
+                Some("CONNACK rejected: broker rejected the username or password"),
+            );
+            assert!(!app.clients.contains_key(&id));
+            assert_eq!(
+                app.reconnect_deadlines.contains_key(&id),
+                automatic_reconnect
+            );
+            if automatic_reconnect {
+                assert_eq!(app.reconnect_attempts.get(&id), Some(&1));
+                // Advance backoff without sleeping, then run the same lifecycle
+                // maintenance used by the UI to start the replacement client.
+                app.reconnect_deadlines.insert(id, Instant::now());
+                app.maintain_clients();
+            } else {
+                app.reconnect_client(id);
+            }
+            let _connected = reply_to_connect(&app, &listener, 0);
+            wait_until(|| {
+                app.maintain_clients();
+                app.connection_states.get(&id) == Some(&ConnectionState::Connected)
+            });
+            assert_tab_state(&app, id, ConnectionState::Connected, None);
+            assert!(!app.reconnect_attempts.contains_key(&id));
+            assert!(!app.reconnect_deadlines.contains_key(&id));
+            assert!(app.clients.contains_key(&id));
+
+            app.disconnect_client(id);
+            wait_until(|| app.clients[&id].join_handle.is_finished());
+            app.maintain_clients();
+            assert_tab_state(&app, id, ConnectionState::Disconnected, None);
+            assert!(!app.clients.contains_key(&id));
+            assert!(!app.reconnect_deadlines.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn finished_clients_keep_backlogged_events_across_frames_and_tabs_are_fair() {
+        use crate::models::client::{CommandSender, ControlOverflow, QueuedEvent};
+        use crate::models::ipc::ClientEvent;
+        use crate::models::limits::{ByteBudget, CLIENT_BUFFER_BYTES};
+        let mut app = empty_app();
+        add_workspace_test_tab(&mut app);
+        let mut second = app.tabs[0].clone();
+        second.id = 8;
+        app.tabs.push(second);
+        for id in [7, 8] {
+            let (sender, receiver) = mpsc::sync_channel(400);
+            let budget = ByteBudget::new(CLIENT_BUFFER_BYTES);
+            let count = if id == 7 { 300 } else { 1 };
+            for _ in 0..count {
+                let event = ClientEvent::MessageReceived {
+                    topic: "load".into(),
+                    qos: 0,
+                    retain: false,
+                    payload: vec![1],
+                };
+                sender
+                    .try_send(QueuedEvent {
+                        _permit: budget.reserve(event.buffer_bytes()).unwrap(),
+                        event,
+                    })
+                    .unwrap();
+            }
+            drop(sender);
+            let (command_tx, _) = tokio::sync::mpsc::channel(1);
+            let join_handle = app.runtime.spawn(async {});
+            app.runtime.block_on(async {
+                while !join_handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            });
+            app.clients.insert(
+                id,
+                ClientHandle {
+                    cancellation: CancellationToken::new(),
+                    join_handle,
+                    event_rx: receiver,
+                    command_tx: CommandSender {
+                        sender: command_tx,
+                        budget,
+                    },
+                    queued_messages: Arc::new(AtomicUsize::new(count)),
+                    dropped_messages: Arc::new(AtomicU64::new(0)),
+                    control_overflow: Arc::new(ControlOverflow::default()),
+                    event_stream_closed: std::sync::atomic::AtomicBool::new(false),
+                },
+            );
+        }
+        app.maintain_clients();
+        assert!(
+            app.clients.contains_key(&7),
+            "finished producer must retain its backlog"
+        );
+        let TabState::Client { received_count, .. } = &app.tabs[0].state;
+        assert!(*received_count <= 128);
+        for _ in 0..20 {
+            if app.clients.is_empty() {
+                break;
+            }
+            app.maintain_clients();
+        }
+        assert!(app.clients.is_empty());
+        let TabState::Client { received_count, .. } = &app.tabs[0].state;
+        assert_eq!(*received_count, 300);
+        let TabState::Client { received_count, .. } = &app.tabs[1].state;
+        assert_eq!(*received_count, 1);
     }
 
     #[test]
@@ -781,6 +1199,12 @@ mod tests {
     fn queue_full_is_distinct_from_a_closed_channel() {
         let mut app = empty_app();
         let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+        let command_tx = crate::models::client::CommandSender {
+            sender: command_tx,
+            budget: crate::models::limits::ByteBudget::new(
+                crate::models::limits::CLIENT_BUFFER_BYTES,
+            ),
+        };
         command_tx.try_send(ClientCommand::Disconnect).unwrap();
         let (_event_tx, event_rx) = mpsc::sync_channel(1);
         let join_handle = app.runtime.spawn(std::future::pending());
@@ -790,6 +1214,8 @@ mod tests {
                 cancellation: CancellationToken::new(),
                 join_handle,
                 event_rx,
+                control_overflow: Arc::new(crate::models::client::ControlOverflow::default()),
+                event_stream_closed: std::sync::atomic::AtomicBool::new(false),
                 command_tx,
                 queued_messages: Arc::new(AtomicUsize::new(0)),
                 dropped_messages: Arc::new(AtomicU64::new(0)),

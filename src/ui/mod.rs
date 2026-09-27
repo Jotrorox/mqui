@@ -11,6 +11,7 @@ use crate::models::mqtt::{
     ConnectionInputMode, MqttLoginData, ReceivedMessage, TlsVerificationMode, TransportKind,
     mqtt_topic_matches,
 };
+use crate::models::payload::PublishEncoding;
 use crate::ui::widgets::qos_picker;
 use crate::utils::formatting::{format_json, format_payload, format_timestamp};
 
@@ -54,6 +55,40 @@ fn connection_color(state: ConnectionState, visuals: &egui::Visuals) -> egui::Co
 
 fn disabled_reason(action: &str, state: ConnectionState) -> String {
     format!("{action} is unavailable while the connection is {state}.")
+}
+
+#[derive(Clone)]
+struct MessageFilterCache {
+    topic: String,
+    mode: MessageFilterMode,
+    payload: String,
+    results: std::collections::HashMap<u64, bool>,
+}
+
+impl MessageFilterCache {
+    fn update(&mut self, messages: &std::collections::VecDeque<ReceivedMessage>) -> bool {
+        self.results
+            .retain(|id, _| messages.front().is_some_and(|first| *id >= first.id));
+        let started = std::time::Instant::now();
+        let mut bytes = 0;
+        let mut count = 0;
+        for message in messages.iter().rev() {
+            if self.results.contains_key(&message.id) {
+                continue;
+            }
+            if count >= 128
+                || bytes >= 512 * 1024
+                || started.elapsed() >= std::time::Duration::from_millis(2)
+            {
+                return true;
+            }
+            let matches = message_matches(message, &self.topic, self.mode, &self.payload);
+            self.results.insert(message.id, matches);
+            bytes += message.buffer_bytes();
+            count += 1;
+        }
+        false
+    }
 }
 
 fn message_matches(
@@ -137,14 +172,20 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let top_bar_fill = ui.style().visuals.panel_fill;
 
-    if let Some(warning) = app.workspace_warning.clone() {
+    if app.workspace_warning.is_some() || app.workspace_save_blocked() {
         egui::Panel::top("workspace_warning").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().warn_fg_color, warning);
-                if ui.small_button("Dismiss").clicked() {
-                    app.workspace_warning = None;
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                app.workspace_warning.as_deref().unwrap_or("Workspace saving is disabled."),
+            );
+            if app.workspace_save_blocked() {
+                ui.label("To save this session, back up the original file and replace it with the current workspace.");
+                if ui.button("Back up original and enable saving").clicked() {
+                    app.recover_workspace();
                 }
-            });
+            } else if ui.small_button("Dismiss").clicked() {
+                app.workspace_warning = None;
+            }
         });
     }
 
@@ -938,6 +979,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 publish_qos,
                 publish_retain,
                 publish_payload,
+                publish_encoding,
                 payload_view,
                 topic_filter,
                 message_filter_mode,
@@ -948,6 +990,7 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 selected_message_id,
                 subscriptions,
                 messages,
+                history_bytes,
                 received_count,
                 dropped_message_count,
                 published_count,
@@ -1266,7 +1309,35 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     qos_picker(ui, &format!("pub_qos_{active_id}"), publish_qos);
                     ui.checkbox(publish_retain, "Retain");
                 });
-                ui.label("Payload");
+                ui.horizontal(|ui| {
+                    ui.label("Payload");
+                    let mut selected_encoding = *publish_encoding;
+                    ui.selectable_value(
+                        &mut selected_encoding, PublishEncoding::Text, "Text (UTF-8)",
+                    );
+                    ui.selectable_value(
+                        &mut selected_encoding, PublishEncoding::Hex, "Hex (bytes)",
+                    );
+                    if selected_encoding != *publish_encoding {
+                        match publish_encoding.decode(publish_payload)
+                            .and_then(|bytes| selected_encoding.encode(&bytes))
+                        {
+                            Ok(converted) => {
+                                *publish_payload = converted;
+                                *publish_encoding = selected_encoding;
+                            }
+                            Err(message) => {
+                                *current_error = Some(ActionableError {
+                                    message,
+                                    scope: ErrorScope::Publish,
+                                });
+                            }
+                        }
+                    }
+                });
+                if *publish_encoding == PublishEncoding::Hex {
+                    ui.label("Enter hex byte pairs, for example: 00 ff 80. Whitespace is optional.");
+                }
                 ui.add(egui::TextEdit::multiline(publish_payload).desired_rows(3));
                 let publish = ui
                     .add_enabled(
@@ -1277,12 +1348,20 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                 if publish.clicked() {
                     let topic = publish_topic.trim().to_string();
                     if !topic.is_empty() {
-                        commands_to_send.push(ClientCommand::Publish {
-                            topic,
-                            payload: publish_payload.as_bytes().to_vec(),
-                            qos: *publish_qos,
-                            retain: *publish_retain,
-                        });
+                        match publish_encoding.decode(publish_payload) {
+                            Ok(payload) => commands_to_send.push(ClientCommand::Publish {
+                                topic,
+                                payload,
+                                qos: *publish_qos,
+                                retain: *publish_retain,
+                            }),
+                            Err(message) => {
+                                *current_error = Some(ActionableError {
+                                    message,
+                                    scope: ErrorScope::Publish,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -1312,11 +1391,14 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         .clicked()
                     {
                         messages.clear();
+                        *history_bytes = 0;
                         *selected_message_id = None;
                     }
                 });
                 while messages.len() > *max_messages {
-                    let _ = messages.pop_front();
+                    if let Some(evicted) = messages.pop_front() {
+                        *history_bytes -= evicted.buffer_bytes();
+                    }
                 }
                 if selected_message_id.is_some_and(|selected| {
                     !messages.iter().any(|message| message.id == selected)
@@ -1348,6 +1430,24 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         .on_hover_text("Searches UTF-8 payloads only");
                 });
 
+                let cache_id = egui::Id::new(("message_filter_cache", active_id));
+                let mut cache = ui.ctx().data_mut(|data| data.get_temp::<MessageFilterCache>(cache_id))
+                    .unwrap_or_else(|| MessageFilterCache {
+                        topic: topic_filter.clone(), mode: *message_filter_mode,
+                        payload: payload_search.clone(), results: Default::default(),
+                    });
+                if cache.topic != *topic_filter || cache.mode != *message_filter_mode || cache.payload != *payload_search {
+                    cache.topic.clone_from(topic_filter);
+                    cache.mode = *message_filter_mode;
+                    cache.payload.clone_from(payload_search);
+                    cache.results.clear();
+                }
+                let filtering = cache.update(messages);
+                if filtering { ui.ctx().request_repaint(); }
+                let visible: Vec<_> = messages.iter().rev()
+                    .filter(|message| cache.results.get(&message.id) == Some(&true)).collect();
+                ui.ctx().data_mut(|data| data.insert_temp(cache_id, cache));
+
                 let inspector_height = (main_viewport_height - 160.0).max(220.0);
                 let selected_for_frame = *selected_message_id;
                 let mut next_selection = selected_for_frame;
@@ -1356,42 +1456,30 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                     egui::ScrollArea::vertical()
                         .id_salt(("messages_scroll", active_id))
                         .max_height(inspector_height)
-                        .show(ui, |ui| {
-                            let mut shown = 0usize;
-                            for msg in messages.iter().rev() {
-                                if shown >= *max_messages
-                                    || !message_matches(
-                                        msg,
-                                        topic_filter,
-                                        *message_filter_mode,
-                                        payload_search,
-                                    )
-                                {
-                                    continue;
-                                }
+                        .show_rows(ui, ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 6.0, visible.len(), |ui, rows| {
+                            for index in rows {
+                                let msg = visible[index];
                                 let selected = selected_for_frame == Some(msg.id);
                                 let summary = format!(
                                     "{}  {}  Q{}{}  {} B\n{}",
                                     format_timestamp(msg.timestamp),
-                                    msg.topic,
+                                    msg.topic.chars().take(120).collect::<String>(),
                                     msg.qos,
                                     if msg.retain { " R" } else { "" },
                                     msg.payload.len(),
                                     msg.preview
                                 );
                                 if ui
-                                    .selectable_label(selected, summary)
+                                    .add(egui::Button::selectable(selected, summary).wrap_mode(egui::TextWrapMode::Truncate))
                                     .on_hover_text("Select to inspect this message")
                                     .clicked()
                                 {
                                     next_selection = Some(msg.id);
                                 }
-                                shown += 1;
-                            }
-                            if shown == 0 {
-                                ui.label("No messages matched the current filters.");
                             }
                         });
+                    if filtering { ui.label("Filtering messages…"); }
+                    else if visible.is_empty() { ui.label("No messages matched the current filters."); }
                 };
 
                 let mut detail = |ui: &mut egui::Ui| {
@@ -1445,11 +1533,16 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                             *publish_topic = message.topic.clone();
                             *publish_qos = message.qos;
                             *publish_retain = message.retain;
-                            *publish_payload =
-                                String::from_utf8_lossy(&message.payload).into_owned();
+                            (*publish_encoding, *publish_payload) =
+                                PublishEncoding::from_bytes(&message.payload);
                         }
                     });
-                    let pretty_json = format_json(&message.payload);
+                    let displayed = &message.payload[..message.payload.len().min(crate::models::limits::DETAIL_BYTES)];
+                    let truncated = displayed.len() < message.payload.len();
+                    if truncated {
+                        ui.label("Preview limited to 16 KiB. Copy or save for the full payload.");
+                    }
+                    let pretty_json = if truncated { None } else { format_json(displayed) };
                     ui.horizontal(|ui| {
                         ui.selectable_value(payload_view, PayloadView::Text, "Text");
                         ui.selectable_value(payload_view, PayloadView::Hex, "Hex");
@@ -1462,10 +1555,8 @@ pub(crate) fn render(app: &mut App, ui: &mut egui::Ui) {
                         }
                     });
                     let payload_text = match payload_view {
-                        PayloadView::Text => std::str::from_utf8(&message.payload)
-                            .map(str::to_owned)
-                            .unwrap_or_else(|_| "Payload is not valid UTF-8. Use Hex.".to_string()),
-                        PayloadView::Hex => format_payload(&message.payload, true),
+                        PayloadView::Text => String::from_utf8_lossy(displayed).into_owned(),
+                        PayloadView::Hex => format_payload(displayed, true),
                         PayloadView::Json => pretty_json.unwrap_or_default(),
                     };
                     egui::ScrollArea::both()
@@ -1523,6 +1614,43 @@ mod inspector_tests {
             false,
             payload.to_vec(),
         )
+    }
+
+    #[test]
+    fn payload_filter_progresses_across_frames_and_reuses_results() {
+        let mut messages = std::collections::VecDeque::new();
+        for id in 0..10 {
+            messages.push_back(ReceivedMessage::new(
+                id,
+                std::time::SystemTime::now(),
+                "topic".into(),
+                0,
+                false,
+                vec![b'a'; 256 * 1024],
+            ));
+        }
+        let mut cache = MessageFilterCache {
+            topic: String::new(),
+            mode: MessageFilterMode::Substring,
+            payload: "a".into(),
+            results: Default::default(),
+        };
+        assert!(cache.update(&messages));
+        assert!(cache.results.len() <= 2);
+        for _ in 0..20 {
+            if !cache.update(&messages) {
+                break;
+            }
+        }
+        assert_eq!(cache.results.len(), 10);
+        assert!(cache.results.values().all(|matches| *matches));
+        assert!(!cache.update(&messages));
+        messages.pop_front();
+        cache.update(&messages);
+        assert!(!cache.results.contains_key(&0));
+        messages.clear();
+        cache.update(&messages);
+        assert!(cache.results.is_empty());
     }
 
     #[test]

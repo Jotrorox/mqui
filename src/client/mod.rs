@@ -1,23 +1,35 @@
+mod limited_transport;
+#[cfg(test)]
+mod protocol_tests;
+#[cfg(test)]
+mod resource_tests;
+
 use mqtt_endpoint_tokio::mqtt_ep;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::time::timeout;
-use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::{client_async_with_config, tungstenite::protocol::WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
-use crate::models::client::ClientHandle;
+use crate::models::client::{
+    ClientHandle, CommandSender, ControlOverflow, QueuedCommand, QueuedEvent,
+};
 use crate::models::ipc::{ClientCommand, ClientEvent, ConnectionState};
+use crate::models::limits::{
+    ByteBudget, BytePermit, CLIENT_BUFFER_BYTES, CONTROL_BUFFER_BYTES, MAX_IN_FLIGHT,
+    MAX_PACKET_BYTES,
+};
 use crate::models::mqtt::{MqttLoginData, TlsVerificationMode, TransportKind};
 use crate::utils::qos::qos_to_u8;
 
@@ -35,7 +47,11 @@ const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct EventSender {
-    sender: mpsc::SyncSender<ClientEvent>,
+    sender: mpsc::SyncSender<QueuedEvent>,
+    budget: ByteBudget,
+    control_budget: ByteBudget,
+    control_overflow: Arc<ControlOverflow>,
+    cancellation: CancellationToken,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     queued_messages: Arc<AtomicUsize>,
     dropped_messages: Arc<AtomicU64>,
@@ -48,12 +64,27 @@ impl EventSender {
             return self.send_message(event);
         }
 
-        self.sender.try_send(event).map_err(|err| {
-            // Control events are protected from message floods by the reserved
-            // queue capacity. If producers themselves exhaust that reserve, do
-            // not turn the failure into silent state loss.
-            eprintln!("mqui: failed to deliver control event: {err}");
-        })?;
+        if self.control_overflow.failed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let permit = self.control_budget.reserve(event.buffer_bytes());
+        if permit.is_none()
+            || self
+                .sender
+                .try_send(QueuedEvent {
+                    event,
+                    _permit: permit.unwrap(),
+                })
+                .is_err()
+        {
+            self.control_overflow.failed.store(true, Ordering::Release);
+            *self.control_overflow.terminal.lock().unwrap() = Some(ClientEvent::ControlOverflow);
+            self.cancellation.cancel();
+            if let Some(repaint) = &self.repaint {
+                repaint();
+            }
+            return Err(());
+        }
         if let Some(repaint) = &self.repaint {
             repaint();
         }
@@ -72,7 +103,17 @@ impl EventSender {
             return Err(());
         }
 
-        if self.sender.try_send(event).is_err() {
+        let permit = self.budget.reserve(event.buffer_bytes());
+        if permit.is_none()
+            || self.control_overflow.failed.load(Ordering::Acquire)
+            || self
+                .sender
+                .try_send(QueuedEvent {
+                    event,
+                    _permit: permit.unwrap(),
+                })
+                .is_err()
+        {
             self.queued_messages.fetch_sub(1, Ordering::AcqRel);
             self.record_dropped_message();
             return Err(());
@@ -142,6 +183,8 @@ struct IncomingQos2Message {
     qos: u8,
     retain: bool,
     payload: Vec<u8>,
+    _permit: BytePermit,
+    deadline: tokio::time::Instant,
 }
 
 fn connack_error(code: mqtt_ep::result_code::ConnectReasonCode) -> Option<String> {
@@ -310,6 +353,28 @@ fn build_tls_config(
     }
 }
 
+fn receive_error(
+    context: &str,
+    error: impl std::fmt::Display,
+    packet_limit_exceeded: &AtomicBool,
+) -> String {
+    if packet_limit_exceeded.load(Ordering::Acquire) {
+        format!(
+            "{context} failed: MQTT packet size limit ({MAX_PACKET_BYTES} bytes) exceeded or invalid length"
+        )
+    } else {
+        format!("{context} failed: {error}")
+    }
+}
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_PACKET_BYTES),
+        max_frame_size: Some(MAX_PACKET_BYTES),
+        ..Default::default()
+    }
+}
+
 fn build_websocket_request(addr: &str, path: &str) -> Result<Request<()>, String> {
     let url = format!("ws://{addr}{path}");
     Request::builder()
@@ -363,9 +428,10 @@ async fn connect_transport(
                         .await
                         .map_err(|err| format!("WebSocket TCP connect failed: {err}"))?;
                 let request = build_websocket_request(&resolved.addr, path)?;
-                let (stream, _response) = client_async(request, tcp_stream)
-                    .await
-                    .map_err(|err| format!("WebSocket connect failed: {err}"))?;
+                let (stream, _response) =
+                    client_async_with_config(request, tcp_stream, Some(websocket_config()))
+                        .await
+                        .map_err(|err| format!("WebSocket connect failed: {err}"))?;
                 Box::new(mqtt_ep::transport::WebSocketTransport::from_tcp_client_stream(stream))
             }
             TransportKind::Wss => {
@@ -377,16 +443,19 @@ async fn connect_transport(
                     .as_deref()
                     .ok_or_else(|| "Secure WebSocket transport requires a path".to_string())?;
                 let tls_config = build_tls_config(login, domain)?;
-                let stream = mqtt_ep::transport::connect_helper::connect_tcp_tls_ws(
+                let tls_stream = mqtt_ep::transport::connect_helper::connect_tcp_tls(
                     &resolved.addr,
                     domain,
-                    path,
                     tls_config,
-                    None,
                     None,
                 )
                 .await
-                .map_err(|err| format!("Secure WebSocket connect failed: {err}"))?;
+                .map_err(|err| format!("Secure WebSocket TLS connect failed: {err}"))?;
+                let request = build_websocket_request(&resolved.addr, path)?;
+                let (stream, _) =
+                    client_async_with_config(request, tls_stream, Some(websocket_config()))
+                        .await
+                        .map_err(|err| format!("Secure WebSocket connect failed: {err}"))?;
                 Box::new(mqtt_ep::transport::WebSocketTransport::from_tls_client_stream(stream))
             }
         };
@@ -423,24 +492,67 @@ pub fn spawn_headless_client(
     spawn_client_inner(runtime, client_key, login, None)
 }
 
+async fn checked_connect_send(
+    send: impl std::future::Future<Output = Result<(), mqtt_ep::connection_error::ConnectionError>>,
+    write_error: &Mutex<Option<String>>,
+) -> Result<(), String> {
+    send.await.map_err(|err| err.to_string())?;
+    match write_error.lock().unwrap().take() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 fn spawn_client_inner(
     runtime: &Runtime,
     tab_id: u64,
     login: MqttLoginData,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> ClientHandle {
+    spawn_client_with_connector(
+        runtime,
+        tab_id,
+        login,
+        repaint,
+        |login, cancellation| async move { connect_transport(&login, &cancellation).await },
+    )
+}
+
+fn spawn_client_with_connector<F, Fut>(
+    runtime: &Runtime,
+    tab_id: u64,
+    login: MqttLoginData,
+    repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    connect: F,
+) -> ClientHandle
+where
+    F: FnOnce(MqttLoginData, CancellationToken) -> Fut + Send + 'static,
+    Fut: std::future::Future<
+            Output = Result<(Box<dyn mqtt_ep::transport::TransportOps + Send>, String), String>,
+        > + Send,
+{
+    let budget = ByteBudget::new(CLIENT_BUFFER_BYTES - CONTROL_BUFFER_BYTES);
+    let control_overflow = Arc::new(ControlOverflow::default());
+    let cancellation = CancellationToken::new();
     let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
     let queued_messages = Arc::new(AtomicUsize::new(0));
     let dropped_messages = Arc::new(AtomicU64::new(0));
     let event_tx = EventSender {
         sender: event_tx,
+        budget: budget.clone(),
+        control_budget: ByteBudget::new(CONTROL_BUFFER_BYTES),
+        control_overflow: control_overflow.clone(),
+        cancellation: cancellation.clone(),
         repaint,
         queued_messages: Arc::clone(&queued_messages),
         dropped_messages: Arc::clone(&dropped_messages),
         message_capacity: MESSAGE_EVENT_CAPACITY,
     };
-    let (command_tx, mut command_rx) = tokio_mpsc::channel::<ClientCommand>(COMMAND_CAPACITY);
-    let cancellation = CancellationToken::new();
+    let (command_tx, mut command_rx) = tokio_mpsc::channel::<QueuedCommand>(COMMAND_CAPACITY);
+    let command_tx = CommandSender {
+        sender: command_tx,
+        budget: budget.clone(),
+    };
     let task_cancellation = cancellation.clone();
     let client_id = login.effective_client_id(tab_id);
     let keep_alive_secs = login.effective_keep_alive_secs();
@@ -463,15 +575,17 @@ fn spawn_client_inner(
         )));
 
         let endpoint = mqtt_ep::endpoint::Endpoint::<mqtt_ep::role::Client>::new(mqtt_ep::Version::V5_0);
-        let (transport, display_label) = match connect_transport(&login, &task_cancellation).await {
+        let (transport, display_label) = match connect(login.clone(), task_cancellation.clone()).await {
             Ok(transport) => transport,
             Err(err) => {
                 let _ = event_tx.send(ClientEvent::Disconnected(err));
                 return;
             }
         };
+        let packet_limit_exceeded = Arc::new(AtomicBool::new(false));
+        let transport_write_error = Arc::new(Mutex::new(None));
         if let Err(err) = endpoint
-            .attach(transport, mqtt_ep::endpoint::Mode::Client)
+            .attach(limited_transport::LimitedTransport::new(transport, packet_limit_exceeded.clone(), transport_write_error.clone()), mqtt_ep::endpoint::Mode::Client)
             .await
         {
             let _ = event_tx.send(ClientEvent::Disconnected(format!("Attach failed: {err}")));
@@ -493,6 +607,11 @@ fn spawn_client_inner(
                 return;
             }
         };
+
+        connect_builder = connect_builder.props(vec![
+            mqtt_ep::packet::Property::MaximumPacketSize(mqtt_ep::packet::MaximumPacketSize::new(MAX_PACKET_BYTES as u32).unwrap()),
+            mqtt_ep::packet::Property::ReceiveMaximum(mqtt_ep::packet::ReceiveMaximum::new(MAX_IN_FLIGHT as u16).unwrap()),
+        ]);
 
         if let Some(username) = login.username_opt() {
             connect_builder = match connect_builder.user_name(username) {
@@ -551,11 +670,22 @@ fn spawn_client_inner(
             }
         };
 
+        if connect_packet.size() > MAX_PACKET_BYTES {
+            let _ = event_tx.send(ClientEvent::Disconnected("CONNECT exceeds packet size limit".into()));
+            let _ = endpoint.close().await;
+            return;
+        }
         let send_connect = tokio::select! {
-            () = task_cancellation.cancelled() => return,
-            result = timeout(MQTT_HANDSHAKE_TIMEOUT, endpoint.send(connect_packet)) => result,
+            () = task_cancellation.cancelled() => {
+                let _ = endpoint.close().await;
+                return;
+            }
+            result = timeout(MQTT_HANDSHAKE_TIMEOUT, checked_connect_send(endpoint.send(connect_packet), &transport_write_error)) => result,
         };
-        if let Err(err) = send_connect.map_err(|_| "CONNECT send timed out") {
+        if let Err(err) = send_connect
+            .map_err(|_| "CONNECT send timed out".to_string())
+            .and_then(|result| result)
+        {
             let _ = event_tx.send(ClientEvent::Disconnected(format!("CONNECT send failed: {err}")));
             let _ = endpoint.close().await;
             return;
@@ -576,7 +706,7 @@ fn spawn_client_inner(
             Ok(result) => match result {
             Ok(packet) => packet,
             Err(err) => {
-                let _ = event_tx.send(ClientEvent::Disconnected(format!("CONNACK recv failed: {err}")));
+                let _ = event_tx.send(ClientEvent::Disconnected(receive_error("CONNACK recv", err, &packet_limit_exceeded)));
                 let _ = endpoint.close().await;
                 return;
             }
@@ -607,6 +737,7 @@ fn spawn_client_inner(
             }
         }
 
+        let mut outgoing_permits: HashMap<u16, BytePermit> = HashMap::new();
         let mut pending_subscribe: HashMap<u16, (String, u8)> = HashMap::new();
         let mut pending_unsubscribe: HashMap<u16, String> = HashMap::new();
         let mut pending_publish: HashMap<u16, OutgoingPublishState> = HashMap::new();
@@ -619,19 +750,12 @@ fn spawn_client_inner(
             tokio::select! {
                 _ = acknowledgement_timer.tick() => {
                     let now = tokio::time::Instant::now();
-                    let expired: Vec<u16> = acknowledgement_deadlines
-                        .iter()
-                        .filter_map(|(id, deadline)| (*deadline <= now).then_some(*id))
-                        .collect();
-                    for packet_id in expired {
-                        acknowledgement_deadlines.remove(&packet_id);
-                        pending_subscribe.remove(&packet_id);
-                        pending_unsubscribe.remove(&packet_id);
-                        pending_publish.remove(&packet_id);
-                        let _ = endpoint.release_packet_id(packet_id).await;
-                        let _ = event_tx.try_send(ClientEvent::Error(format!(
-                            "Acknowledgement timed out for packet id {packet_id}"
-                        )));
+                    if acknowledgement_deadlines.values().any(|deadline| *deadline <= now)
+                        || incoming_qos2.values().any(|message| message.deadline <= now) {
+                        // Closing also frees the endpoint's retained QoS packets.
+                        let _ = event_tx.send(ClientEvent::Disconnected("Acknowledgement timed out; connection closed".into()));
+                        let _ = endpoint.close().await;
+                        break;
                     }
                 }
                 () = task_cancellation.cancelled() => {
@@ -641,9 +765,16 @@ fn spawn_client_inner(
                 }
                 maybe_command = command_rx.recv() => {
                     let Some(command) = maybe_command else {
-                        continue;
+                        let _ = endpoint.close().await;
+                        let _ = event_tx.send(ClientEvent::Disconnected("Command channel closed".into()));
+                        break;
                     };
 
+                    let QueuedCommand { command, permit } = command;
+                    if !matches!(command, ClientCommand::Disconnect) && outgoing_permits.len() >= MAX_IN_FLIGHT {
+                        let _ = event_tx.send(ClientEvent::Error("Too many in-flight commands; try again after acknowledgements arrive".into()));
+                        continue;
+                    }
                     match command {
                         ClientCommand::Disconnect => {
                             let disconnect_packet = mqtt_ep::packet::v5_0::Disconnect::builder()
@@ -705,6 +836,7 @@ fn spawn_client_inner(
                                 continue;
                             }
 
+                            outgoing_permits.insert(packet_id, permit);
                             pending_subscribe.insert(packet_id, (topic, qos));
                             acknowledgement_deadlines.insert(
                                 packet_id,
@@ -739,6 +871,7 @@ fn spawn_client_inner(
                                 continue;
                             }
 
+                            outgoing_permits.insert(packet_id, permit);
                             pending_unsubscribe.insert(packet_id, topic);
                             acknowledgement_deadlines.insert(
                                 packet_id,
@@ -814,6 +947,7 @@ fn spawn_client_inner(
                                         topic: topic.clone(),
                                     }
                                 };
+                                outgoing_permits.insert(id, permit);
                                 pending_publish.insert(id, state);
                                 acknowledgement_deadlines.insert(
                                     id,
@@ -829,7 +963,7 @@ fn spawn_client_inner(
                     let packet = match recv_result {
                         Ok(packet) => packet,
                         Err(err) => {
-                            let _ = event_tx.send(ClientEvent::Disconnected(format!("Receive loop failed: {err}")));
+                            let _ = event_tx.send(ClientEvent::Disconnected(receive_error("Receive loop", err, &packet_limit_exceeded)));
                             let _ = endpoint.close().await;
                             break;
                         }
@@ -885,15 +1019,19 @@ fn spawn_client_inner(
                                         if !duplicate {
                                             completed_incoming_qos2.remove(&packet_id);
                                         }
-                                        if !completed_incoming_qos2.contains(&packet_id) {
-                                            incoming_qos2.entry(packet_id).or_insert(
-                                                IncomingQos2Message {
-                                                    topic,
-                                                    qos: qos_to_u8(qos_level),
-                                                    retain,
-                                                    payload,
-                                                },
-                                            );
+                                        if !completed_incoming_qos2.contains(&packet_id) && !incoming_qos2.contains_key(&packet_id) {
+                                            let bytes = topic.capacity() + payload.capacity() + std::mem::size_of::<IncomingQos2Message>();
+                                            let permit = budget.reserve(bytes);
+                                            if permit.is_none() || incoming_qos2.len() >= MAX_IN_FLIGHT {
+                                                let _ = event_tx.send(ClientEvent::Disconnected("Incoming QoS 2 byte or message budget exhausted".into()));
+                                                let _ = endpoint.close().await;
+                                                break;
+                                            }
+                                            incoming_qos2.insert(packet_id, IncomingQos2Message {
+                                                topic, qos: qos_to_u8(qos_level), retain, payload,
+                                                _permit: permit.unwrap(),
+                                                deadline: tokio::time::Instant::now() + ACK_TIMEOUT,
+                                            });
                                         }
                                         let pubrec = match mqtt_ep::packet::v5_0::Pubrec::builder()
                                             .packet_id(packet_id)
@@ -919,8 +1057,9 @@ fn spawn_client_inner(
                         }
                         mqtt_ep::packet::Packet::V5_0Suback(suback) => {
                             let packet_id = suback.packet_id();
-                            acknowledgement_deadlines.remove(&packet_id);
                             if let Some((topic, qos)) = pending_subscribe.remove(&packet_id) {
+                                acknowledgement_deadlines.remove(&packet_id);
+                                outgoing_permits.remove(&packet_id);
                                 let codes = suback.reason_codes();
                                 match suback_result(&codes) {
                                     Ok((granted_qos, details)) => {
@@ -945,8 +1084,9 @@ fn spawn_client_inner(
                         }
                         mqtt_ep::packet::Packet::V5_0Unsuback(unsuback) => {
                             let packet_id = unsuback.packet_id();
-                            acknowledgement_deadlines.remove(&packet_id);
                             if let Some(topic) = pending_unsubscribe.remove(&packet_id) {
+                                acknowledgement_deadlines.remove(&packet_id);
+                                outgoing_permits.remove(&packet_id);
                                 let codes = unsuback.reason_codes();
                                 match unsuback_result(&codes) {
                                     Ok(details) => {
@@ -970,12 +1110,13 @@ fn spawn_client_inner(
                         }
                         mqtt_ep::packet::Packet::V5_0Puback(puback) => {
                             let packet_id = puback.packet_id();
-                            acknowledgement_deadlines.remove(&packet_id);
                             match pending_publish
                                 .remove(&packet_id)
                                 .map(OutgoingPublishState::complete_with_puback)
                             {
                                 Some(Ok(topic)) => {
+                                    acknowledgement_deadlines.remove(&packet_id);
+                                    outgoing_permits.remove(&packet_id);
                                     let reason = puback.reason_code();
                                     if optional_reason_is_success(reason, |code| code.is_success()) {
                                         let _ = event_tx.send(ClientEvent::Published {
@@ -1005,10 +1146,6 @@ fn spawn_client_inner(
                         }
                         mqtt_ep::packet::Packet::V5_0Pubrec(pubrec) => {
                             let packet_id = pubrec.packet_id();
-                            acknowledgement_deadlines.insert(
-                                packet_id,
-                                tokio::time::Instant::now() + ACK_TIMEOUT,
-                            );
                             let reason = pubrec.reason_code();
                             let transition = pending_publish
                                 .remove(&packet_id)
@@ -1016,6 +1153,8 @@ fn spawn_client_inner(
                             if let Some(Ok(OutgoingPublishState::Pubcomp { topic })) = transition
                             {
                                 if !optional_reason_is_success(reason, |code| code.is_success()) {
+                                    outgoing_permits.remove(&packet_id);
+                                    acknowledgement_deadlines.remove(&packet_id);
                                     let _ = event_tx.send(ClientEvent::Error(format!(
                                         "PUBREC rejected publish to '{topic}' (packet id {packet_id}): {}",
                                         reason.expect("failure reason exists")
@@ -1080,12 +1219,13 @@ fn spawn_client_inner(
                         }
                         mqtt_ep::packet::Packet::V5_0Pubcomp(pubcomp) => {
                             let packet_id = pubcomp.packet_id();
-                            acknowledgement_deadlines.remove(&packet_id);
                             match pending_publish
                                 .remove(&packet_id)
                                 .map(OutgoingPublishState::complete_with_pubcomp)
                             {
                                 Some(Ok(topic)) => {
+                                    acknowledgement_deadlines.remove(&packet_id);
+                                    outgoing_permits.remove(&packet_id);
                                     let reason = pubcomp.reason_code();
                                     if optional_reason_is_success(reason, |code| code.is_success()) {
                                         let _ = event_tx.send(ClientEvent::Published {
@@ -1150,6 +1290,7 @@ fn spawn_client_inner(
                             }
 
                             if let Some(message) = message {
+                                drop(message._permit);
                                 completed_incoming_qos2.insert(packet_id);
                                 let _ = event_tx.send(ClientEvent::MessageReceived {
                                     topic: message.topic,
@@ -1190,6 +1331,8 @@ fn spawn_client_inner(
         command_tx,
         queued_messages,
         dropped_messages,
+        control_overflow,
+        event_stream_closed: AtomicBool::new(false),
     }
 }
 
@@ -1204,7 +1347,7 @@ mod tests {
         message_capacity: usize,
     ) -> (
         EventSender,
-        mpsc::Receiver<ClientEvent>,
+        mpsc::Receiver<QueuedEvent>,
         Arc<AtomicUsize>,
         Arc<AtomicU64>,
     ) {
@@ -1214,6 +1357,10 @@ mod tests {
         (
             EventSender {
                 sender,
+                budget: ByteBudget::new(CLIENT_BUFFER_BYTES),
+                control_budget: ByteBudget::new(CONTROL_BUFFER_BYTES),
+                control_overflow: Arc::new(ControlOverflow::default()),
+                cancellation: CancellationToken::new(),
                 repaint: None,
                 queued_messages: Arc::clone(&queued_messages),
                 dropped_messages: Arc::clone(&dropped_messages),
@@ -1292,7 +1439,7 @@ mod tests {
             (ATTEMPTS - MESSAGE_CAPACITY) as u64
         );
 
-        let events: Vec<_> = receiver.try_iter().collect();
+        let events: Vec<_> = receiver.try_iter().map(|queued| queued.event).collect();
         assert_eq!(events.len(), CHANNEL_CAPACITY);
         assert!(
             events
@@ -1326,6 +1473,88 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ClientEvent::Disconnected(_)))
         );
+    }
+
+    fn handle_for_events(
+        runtime: &Runtime,
+        sender: &EventSender,
+        event_rx: mpsc::Receiver<QueuedEvent>,
+    ) -> ClientHandle {
+        let (command_tx, _) = tokio_mpsc::channel(1);
+        ClientHandle {
+            cancellation: sender.cancellation.clone(),
+            join_handle: runtime.spawn(std::future::pending()),
+            event_rx,
+            command_tx: CommandSender {
+                sender: command_tx,
+                budget: sender.budget.clone(),
+            },
+            queued_messages: sender.queued_messages.clone(),
+            dropped_messages: sender.dropped_messages.clone(),
+            control_overflow: sender.control_overflow.clone(),
+            event_stream_closed: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn control_overflow_is_terminal_and_observable_after_full_queue() {
+        let runtime = Runtime::new().unwrap();
+        for blocking in [false, true] {
+            let (sender, receiver, _, _) = test_event_sender(2, 1);
+            let handle = handle_for_events(&runtime, &sender, receiver);
+            sender.send(received_event(1)).unwrap();
+            sender.send(ClientEvent::Connected).unwrap();
+            assert!(
+                sender
+                    .send(ClientEvent::Subscribed {
+                        topic: "a".into(),
+                        qos: 1,
+                        details: "ok".into()
+                    })
+                    .is_err()
+            );
+            assert!(sender.cancellation.is_cancelled());
+            assert!(sender.send(ClientEvent::Connected).is_err());
+            let receive = || {
+                if blocking {
+                    handle.recv_timeout(Duration::from_millis(20)).unwrap()
+                } else {
+                    handle.try_recv().unwrap()
+                }
+            };
+            assert!(matches!(receive(), ClientEvent::MessageReceived { .. }));
+            assert!(matches!(receive(), ClientEvent::Connected));
+            assert!(matches!(receive(), ClientEvent::ControlOverflow));
+            assert!(handle.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn byte_budget_drops_messages_and_recovers_after_dequeue() {
+        let runtime = Runtime::new().unwrap();
+        let (mut sender, receiver, queued, dropped) = test_event_sender(10, 9);
+        sender.budget = ByteBudget::new(received_event(1).buffer_bytes());
+        let handle = handle_for_events(&runtime, &sender, receiver);
+        sender.send(received_event(1)).unwrap();
+        assert!(sender.send(received_event(2)).is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(queued.load(Ordering::Acquire), 1);
+        // Reserved control bytes survive data budget exhaustion.
+        sender.send(ClientEvent::Connected).unwrap();
+        handle.try_recv().unwrap();
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        sender.send(received_event(3)).unwrap();
+    }
+
+    #[test]
+    fn control_byte_exhaustion_is_also_observable() {
+        let (mut sender, _, _, _) = test_event_sender(10, 9);
+        sender.control_budget = ByteBudget::new(0);
+        assert!(sender.send(ClientEvent::Connected).is_err());
+        assert!(matches!(
+            *sender.control_overflow.terminal.lock().unwrap(),
+            Some(ClientEvent::ControlOverflow)
+        ));
     }
 
     #[test]

@@ -12,14 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use super::App;
 use super::state::{MessageFilterMode, PayloadView, Tab, TabState};
 use crate::models::ipc::ConnectionState;
 use crate::models::mqtt::{
     ConnectionInputMode, MqttLoginData, SubscriptionEntry, TlsVerificationMode, TransportKind,
+    sanitize_connection_url,
 };
+use crate::models::payload::PublishEncoding;
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
 #[cfg(test)]
@@ -52,6 +53,7 @@ struct PersistedClient {
     publish_qos: u8,
     publish_retain: bool,
     publish_payload: String,
+    publish_encoding: PublishEncoding,
     payload_view_hex: bool,
     topic_filter: String,
     max_messages: usize,
@@ -69,6 +71,7 @@ impl Default for PersistedClient {
             publish_qos: 0,
             publish_retain: false,
             publish_payload: "hello".to_string(),
+            publish_encoding: PublishEncoding::Text,
             payload_view_hex: false,
             topic_filter: String::new(),
             max_messages: 200,
@@ -194,6 +197,7 @@ impl From<&Tab> for PersistedTab {
             publish_qos,
             publish_retain,
             publish_payload,
+            publish_encoding,
             payload_view,
             topic_filter,
             max_messages,
@@ -212,6 +216,7 @@ impl From<&Tab> for PersistedTab {
                 publish_qos: *publish_qos,
                 publish_retain: *publish_retain,
                 publish_payload: publish_payload.clone(),
+                publish_encoding: *publish_encoding,
                 payload_view_hex: *payload_view == PayloadView::Hex,
                 topic_filter: topic_filter.clone(),
                 max_messages: *max_messages,
@@ -247,6 +252,7 @@ impl PersistedTab {
                 publish_qos: self.client.publish_qos.min(2),
                 publish_retain: self.client.publish_retain,
                 publish_payload: self.client.publish_payload,
+                publish_encoding: self.client.publish_encoding,
                 payload_view: if self.client.payload_view_hex {
                     PayloadView::Hex
                 } else {
@@ -270,6 +276,7 @@ impl PersistedTab {
                     })
                     .collect(),
                 messages: VecDeque::new(),
+                history_bytes: 0,
                 received_count: 0,
                 dropped_message_count: 0,
                 current_client_dropped_message_count: 0,
@@ -293,7 +300,7 @@ impl From<&MqttLoginData> for PersistedLogin {
             testament_qos: login.testament_qos,
             testament_retain: login.testament_retain,
             connection_mode: login.connection_mode,
-            connection_url: sanitize_url(&login.connection_url),
+            connection_url: sanitize_connection_url(&login.connection_url),
             transport: login.transport,
             ws_path: login.ws_path.clone(),
             tls_verification: login.tls_verification,
@@ -319,7 +326,7 @@ impl From<PersistedLogin> for MqttLoginData {
             testament_qos: login.testament_qos.min(2),
             testament_retain: login.testament_retain,
             connection_mode: login.connection_mode,
-            connection_url: sanitize_url(&login.connection_url),
+            connection_url: sanitize_connection_url(&login.connection_url),
             transport: login.transport,
             ws_path: login.ws_path,
             tls_verification: login.tls_verification,
@@ -328,25 +335,6 @@ impl From<PersistedLogin> for MqttLoginData {
             reconnect_max_delay_secs: login.reconnect_max_delay_secs.max(1),
         }
     }
-}
-
-fn sanitize_url(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Ok(mut url) = Url::parse(trimmed) {
-        if !url.username().is_empty() || url.password().is_some() {
-            let _ = url.set_username("");
-            let _ = url.set_password(None);
-        }
-        return url.to_string();
-    }
-    // A malformed URL is not connectable; discard an authority containing userinfo
-    // rather than risk writing a credential-shaped value to disk.
-    if let Some((scheme, rest)) = trimmed.split_once("://")
-        && let Some(at) = rest.rfind('@')
-    {
-        return format!("{scheme}://{}", &rest[at + 1..]);
-    }
-    trimmed.to_string()
 }
 
 pub(crate) fn workspace_path() -> Result<PathBuf, String> {
@@ -397,6 +385,26 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Preserve the original bytes under a unique name before explicit recovery.
+/// Any failure leaves the original in place and must keep saving disabled.
+pub(crate) fn backup_workspace(path: &Path) -> io::Result<PathBuf> {
+    let mut source = fs::File::open(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    let mut backup = tempfile::Builder::new()
+        .prefix("workspace-recovery-")
+        .suffix(".bak")
+        .tempfile_in(parent)?;
+    io::copy(&mut source, &mut backup)?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup.keep().map_err(|err| err.error)?;
+    if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(backup_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,7 +419,7 @@ mod tests {
     }
 
     fn sample_app() -> App {
-        let mut app = App::default();
+        let mut app = App::with_workspace_path(None);
         app.tabs.clear();
         app.clients.clear();
         app.connection_states.clear();
@@ -491,6 +499,40 @@ mod tests {
     }
 
     #[test]
+    fn binary_publish_draft_survives_workspace_round_trip() {
+        let mut app = sample_app();
+        let bytes = [0, 0xff, 0x80, b' ', b'\r', b'\n'];
+        let TabState::Client {
+            publish_payload,
+            publish_encoding,
+            ..
+        } = &mut app.tabs[0].state;
+        (*publish_encoding, *publish_payload) = PublishEncoding::from_bytes(&bytes);
+        let decoded: Workspace = toml::from_slice(&serialize(&app).unwrap()).unwrap();
+        let restored = decoded.restore();
+        let TabState::Client {
+            publish_payload,
+            publish_encoding,
+            ..
+        } = &restored.tabs[0].state;
+        assert_eq!(*publish_encoding, PublishEncoding::Hex);
+        assert_eq!(publish_encoding.decode(publish_payload).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_publish_draft_defaults_to_text() {
+        let draft: PersistedClient = toml::from_str("publish_payload = '00 ff'").unwrap();
+        assert_eq!(draft.publish_encoding, PublishEncoding::Text);
+        assert_eq!(
+            draft
+                .publish_encoding
+                .decode(&draft.publish_payload)
+                .unwrap(),
+            b"00 ff"
+        );
+    }
+
+    #[test]
     fn corrupted_file_returns_an_error() {
         let path = temp_path("corrupt");
         fs::write(&path, b"tabs = [ definitely not toml").unwrap();
@@ -555,6 +597,21 @@ id = 9
             .collect();
         assert!(leftovers.is_empty());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recovery_backups_are_unique_and_preserve_exact_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace.toml");
+        let original = b"\xff\xfe invalid TOML";
+        fs::write(&path, original).unwrap();
+        let first = backup_workspace(&path).unwrap();
+        fs::write(&path, b"another failed workspace").unwrap();
+        let second = backup_workspace(&path).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).unwrap(), original);
+        assert_eq!(fs::read(second).unwrap(), b"another failed workspace");
+        assert_eq!(fs::read(path).unwrap(), b"another failed workspace");
     }
 
     impl App {

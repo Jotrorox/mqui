@@ -8,7 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::models::mqtt::{ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind};
+use crate::models::mqtt::{
+    ConnectionInputMode, MqttLoginData, TlsVerificationMode, TransportKind, sanitize_connection_url,
+};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -84,7 +86,7 @@ impl LoginTemplateFile {
             testament_qos: login.testament_qos,
             testament_retain: login.testament_retain,
             connection_mode: login.connection_mode,
-            connection_url: login.connection_url.clone(),
+            connection_url: sanitize_connection_url(&login.connection_url),
             transport: login.transport,
             ws_path: login.ws_path.clone(),
             tls_verification: login.tls_verification,
@@ -108,7 +110,7 @@ impl LoginTemplateFile {
             testament_qos: self.testament_qos,
             testament_retain: self.testament_retain,
             connection_mode: self.connection_mode,
-            connection_url: self.connection_url,
+            connection_url: sanitize_connection_url(&self.connection_url),
             transport: self.transport,
             ws_path: self.ws_path,
             tls_verification: self.tls_verification,
@@ -230,7 +232,7 @@ fn create_profile_in(
         }
         let template =
             LoginTemplateFile::from_login(Some(id.clone()), Some(name.to_string()), login);
-        atomic_write(&path, &serialize(&template, name)?, false)?;
+        atomic_write(&path, &serialize(template, name)?, false)?;
         return Ok(id);
     }
     Err("Could not allocate a unique profile identity".into())
@@ -255,7 +257,7 @@ fn overwrite_profile_in(
     ensure_unique_name(dir, name, Some(id))?;
     let template =
         LoginTemplateFile::from_login(Some(id.to_string()), Some(name.to_string()), login);
-    atomic_write(&path, &serialize(&template, name)?, true)
+    atomic_write(&path, &serialize(template, name)?, true)
 }
 
 pub(crate) fn rename_profile(id: &str, new_name: &str) -> Result<(), String> {
@@ -272,7 +274,7 @@ fn rename_profile_in(dir: &Path, id: &str, new_name: &str) -> Result<(), String>
         .map_err(|err| format!("Failed to parse TOML {}: {err}", path.display()))?;
     template.profile_id = Some(id.to_string());
     template.profile_name = Some(name.to_string());
-    atomic_write(&path, &serialize(&template, name)?, true)
+    atomic_write(&path, &serialize(template, name)?, true)
 }
 
 pub(crate) fn delete_profile(id: &str) -> Result<(), String> {
@@ -290,9 +292,15 @@ pub(crate) fn export_profile(id: &str, destination: &Path) -> Result<(), String>
 }
 
 fn export_profile_file(source: &Path, destination: &Path) -> Result<(), String> {
-    let contents =
-        fs::read(source).map_err(|err| format!("Failed to read {}: {err}", source.display()))?;
-    atomic_write(destination, &contents, true)
+    let contents = fs::read_to_string(source)
+        .map_err(|err| format!("Failed to read {}: {err}", source.display()))?;
+    let template: LoginTemplateFile = toml::from_str(&contents)
+        .map_err(|err| format!("Failed to parse TOML {}: {err}", source.display()))?;
+    atomic_write(
+        destination,
+        &serialize(template, &source.display().to_string())?,
+        true,
+    )
 }
 
 pub(crate) fn load_profile_file(path: &Path) -> Result<MqttLoginData, String> {
@@ -360,8 +368,10 @@ fn existing_path_for_id(dir: &Path, id: &str) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Profile identity '{id}' was not found"))
 }
 
-fn serialize(template: &LoginTemplateFile, name: &str) -> Result<Vec<u8>, String> {
-    toml::to_string_pretty(template)
+fn serialize(mut template: LoginTemplateFile, name: &str) -> Result<Vec<u8>, String> {
+    // Also sanitize profiles read from disk for rename and export.
+    template.connection_url = sanitize_connection_url(&template.connection_url);
+    toml::to_string_pretty(&template)
         .map(String::into_bytes)
         .map_err(|err| format!("Failed to serialize profile '{name}': {err}"))
 }
@@ -506,6 +516,107 @@ mod tests {
                 .unwrap()
                 .contains("secret")
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn create_and_overwrite_redact_urls_in_both_input_modes() {
+        let dir = temp_dir("redaction");
+        for mode in [ConnectionInputMode::Structured, ConnectionInputMode::Url] {
+            let mut login = login("Credentials");
+            login.connection_mode = mode;
+            login.connection_url = "mqtt://alice:url-secret@broker.example:1883".into();
+            let id = create_profile_in(&dir, "Credentials", &login).unwrap();
+            let path = existing_path_for_id(&dir, &id).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("alice"));
+            assert!(!text.contains("secret"));
+            assert!(!text.contains("password"));
+            assert_eq!(
+                load_profile_file(&path).unwrap().connection_url,
+                "mqtt://broker.example:1883"
+            );
+
+            // Invalid ports make URL parsing fail, but must not bypass redaction.
+            login.connection_url = "mqtt://bob:other-secret@broker.example:invalid".into();
+            overwrite_profile_in(&dir, &id, "Credentials", &login).unwrap();
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("bob"));
+            assert!(!text.contains("secret"));
+            assert_eq!(
+                load_profile_file(&path).unwrap().connection_url,
+                "mqtt://broker.example:invalid"
+            );
+            assert!(login.connection_url.contains("other-secret"));
+            delete_profile_in(&dir, &id).unwrap();
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_and_rename_sanitize_legacy_profiles() {
+        let dir = temp_dir("legacy-redaction");
+        let source = dir.join("legacy.toml");
+        let destination = dir.join("export.txt");
+        let original = r#"
+# comment-secret
+profile_id = "legacy"
+profile_name = "Legacy"
+name = "Connection"
+username = "saved-user"
+password = "password-secret"
+connection_mode = "url"
+connection_url = "wss://alice:url-secret@broker.example/mqtt"
+transport = "wss"
+keep_alive_secs = 42
+unknown_field = "unknown-secret"
+"#;
+        fs::write(&source, original).unwrap();
+        export_profile_file(&source, &destination).unwrap();
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        rename_profile_in(&dir, "legacy", "Renamed").unwrap();
+
+        for (path, name) in [(&destination, "Legacy"), (&source, "Renamed")] {
+            let text = fs::read_to_string(path).unwrap();
+            assert!(!text.contains("secret"));
+            assert!(!text.contains("alice"));
+            assert!(!text.contains("password"));
+            assert!(!text.contains("unknown_field"));
+            let template: LoginTemplateFile = toml::from_str(&text).unwrap();
+            assert_eq!(template.profile_id.as_deref(), Some("legacy"));
+            assert_eq!(template.profile_name.as_deref(), Some(name));
+            let loaded = template.into_login();
+            assert_eq!(loaded.name, "Connection");
+            assert_eq!(loaded.username, "saved-user");
+            assert_eq!(loaded.connection_url, "wss://broker.example/mqtt");
+            assert_eq!(loaded.transport, TransportKind::Wss);
+            assert_eq!(loaded.keep_alive_secs, 42);
+            assert!(loaded.password.is_empty());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn export_rejects_invalid_profiles_without_touching_destination() {
+        let dir = temp_dir("invalid-export");
+        let source = dir.join("source.toml");
+        let destination = dir.join("export.txt");
+        for contents in [
+            "not = [toml",
+            "connection_url = 42",
+            "transport = 'invalid'",
+        ] {
+            fs::write(&source, contents).unwrap();
+            assert!(export_profile_file(&source, &destination).is_err());
+            assert!(!destination.exists());
+            fs::write(&destination, "keep existing export").unwrap();
+            assert!(export_profile_file(&source, &destination).is_err());
+            assert_eq!(
+                fs::read_to_string(&destination).unwrap(),
+                "keep existing export"
+            );
+            fs::remove_file(&destination).unwrap();
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 

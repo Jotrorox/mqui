@@ -1,4 +1,5 @@
-use std::time::SystemTime;
+use crate::models::limits::HISTORY_BYTES;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::app::App;
 use crate::app::state::{
@@ -55,6 +56,7 @@ pub(crate) fn reduce_client_event(
         activity,
         subscriptions,
         messages,
+        history_bytes,
         max_messages,
         received_count,
         capture_paused,
@@ -66,6 +68,14 @@ pub(crate) fn reduce_client_event(
     } = state;
 
     match event {
+        ClientEvent::ControlOverflow => {
+            *connection_state = ConnectionState::Failed;
+            *current_error = Some(ActionableError {
+                scope: ErrorScope::Connection,
+                message: "Control event queue overflow: connection closed; acknowledgements may be missing".into(),
+            });
+            Some(ConnectionState::Failed)
+        }
         ClientEvent::State(state) => {
             if connection_state.can_transition_to(state) {
                 *connection_state = state;
@@ -95,6 +105,11 @@ pub(crate) fn reduce_client_event(
             Some(ConnectionState::Connected)
         }
         ClientEvent::Disconnected(message) => {
+            if *connection_state == ConnectionState::Disconnecting {
+                *connection_state = ConnectionState::Disconnected;
+                clear_error(current_error, ErrorScope::Connection);
+                return Some(ConnectionState::Disconnected);
+            }
             if !connection_state.can_transition_to(ConnectionState::Failed) {
                 return None;
             }
@@ -161,10 +176,21 @@ pub(crate) fn reduce_client_event(
             }
             let id = *next_message_id;
             *next_message_id = next_message_id.wrapping_add(1);
-            messages.push_back(ReceivedMessage::new(id, now, topic, qos, retain, payload));
-            while messages.len() > (*max_messages).min(MAX_STORED_MESSAGES) {
-                let _ = messages.pop_front();
+            let message = ReceivedMessage::new(id, now, topic, qos, retain, payload);
+            let bytes = message.buffer_bytes();
+            if bytes > HISTORY_BYTES {
+                return None;
             }
+            while *history_bytes + bytes > HISTORY_BYTES
+                || messages.len() >= (*max_messages).clamp(1, MAX_STORED_MESSAGES)
+            {
+                let Some(evicted) = messages.pop_front() else {
+                    break;
+                };
+                *history_bytes -= evicted.buffer_bytes();
+            }
+            *history_bytes += bytes;
+            messages.push_back(message);
             if selected_message_id
                 .is_some_and(|selected| !messages.iter().any(|message| message.id == selected))
             {
@@ -175,36 +201,72 @@ pub(crate) fn reduce_client_event(
     }
 }
 
+// Global limits, shared by every tab. Rotate after each event to avoid a busy
+// client starving quieter tabs. A single event may cross the byte/time boundary.
+const FRAME_EVENTS: usize = 128;
+const FRAME_BYTES: usize = 512 * 1024;
+const FRAME_TIME: Duration = Duration::from_millis(3);
+
+struct FrameBudget {
+    started: Instant,
+    events: usize,
+    bytes: usize,
+}
+
+impl FrameBudget {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            events: 0,
+            bytes: 0,
+        }
+    }
+    fn exhausted(&self) -> bool {
+        self.events >= FRAME_EVENTS
+            || self.bytes >= FRAME_BYTES
+            || self.started.elapsed() >= FRAME_TIME
+    }
+    fn record(&mut self, event: &ClientEvent) {
+        self.events += 1;
+        self.bytes += event.buffer_bytes();
+    }
+}
+
 pub(crate) fn pump_client_events(app: &mut App) {
+    let mut budget = FrameBudget::new();
     let mut state_updates = Vec::new();
-    for tab in &mut app.tabs {
+    let count = app.tabs.len();
+    let mut empty = 0;
+    while count > 0 && empty < count && !budget.exhausted() {
+        let index = app.event_tab_cursor % count;
+        app.event_tab_cursor = (index + 1) % count;
+        let tab = &mut app.tabs[index];
+        let Some(client) = app.clients.get(&tab.id) else {
+            empty += 1;
+            continue;
+        };
         let TabState::Client {
             dropped_message_count,
             current_client_dropped_message_count,
             ..
         } = &mut tab.state;
-
-        let Some(client) = app.clients.get_mut(&tab.id) else {
-            continue;
-        };
         let current_dropped = client.dropped_message_count();
         *dropped_message_count +=
             current_dropped.saturating_sub(*current_client_dropped_message_count);
         *current_client_dropped_message_count = current_dropped;
-
-        loop {
-            match client.try_recv() {
-                Ok(event) => {
-                    if let Some(state) =
-                        reduce_client_event(&mut tab.state, event, SystemTime::now())
-                    {
-                        state_updates.push((tab.id, state));
-                    }
+        match client.try_recv() {
+            Ok(event) => {
+                empty = 0;
+                budget.record(&event);
+                if let Some(state) = reduce_client_event(&mut tab.state, event, SystemTime::now()) {
+                    state_updates.push((tab.id, state));
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
             }
+            Err(_) => empty += 1,
         }
+    }
+    if budget.exhausted() {
+        app.repaint_context.request_repaint();
     }
     for (tab_id, state) in state_updates {
         app.set_connection_state(tab_id, state);
@@ -235,6 +297,7 @@ mod tests {
             publish_qos: 0,
             publish_retain: false,
             publish_payload: String::new(),
+            publish_encoding: crate::models::payload::PublishEncoding::Text,
             payload_view: PayloadView::Text,
             topic_filter: String::new(),
             message_filter_mode: MessageFilterMode::Substring,
@@ -246,6 +309,7 @@ mod tests {
             selected_message_id: None,
             subscriptions: Vec::new(),
             messages: VecDeque::new(),
+            history_bytes: 0,
             received_count: 0,
             dropped_message_count: 0,
             current_client_dropped_message_count: 0,
@@ -256,6 +320,81 @@ mod tests {
     fn error(state: &TabState) -> Option<&ActionableError> {
         let TabState::Client { current_error, .. } = state;
         current_error.as_ref()
+    }
+
+    #[test]
+    fn history_evicts_by_bytes_and_clears_evicted_selection() {
+        let mut state = state();
+        let TabState::Client {
+            selected_message_id,
+            ..
+        } = &mut state;
+        *selected_message_id = Some(0);
+        for _ in 0..100 {
+            reduce_client_event(
+                &mut state,
+                ClientEvent::MessageReceived {
+                    topic: "large".into(),
+                    qos: 0,
+                    retain: false,
+                    payload: vec![0; crate::models::limits::MAX_PACKET_BYTES / 2],
+                },
+                SystemTime::now(),
+            );
+        }
+        let TabState::Client {
+            messages,
+            history_bytes,
+            selected_message_id,
+            received_count,
+            ..
+        } = state;
+        assert!(!messages.is_empty());
+        assert!(messages.len() < 100);
+        assert!(history_bytes <= HISTORY_BYTES);
+        assert_eq!(
+            history_bytes,
+            messages
+                .iter()
+                .map(ReceivedMessage::buffer_bytes)
+                .sum::<usize>()
+        );
+        assert_eq!(selected_message_id, None);
+        assert_eq!(received_count, 100);
+    }
+
+    #[test]
+    fn frame_budget_bounds_event_count_bytes_and_time() {
+        let mut budget = FrameBudget::new();
+        for _ in 0..FRAME_EVENTS {
+            budget.record(&ClientEvent::Connected);
+        }
+        assert!(budget.exhausted());
+        let mut budget = FrameBudget::new();
+        budget.record(&ClientEvent::MessageReceived {
+            topic: String::new(),
+            qos: 0,
+            retain: false,
+            payload: vec![0; FRAME_BYTES],
+        });
+        assert!(budget.exhausted());
+        let mut budget = FrameBudget::new();
+        budget.started -= FRAME_TIME;
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn control_overflow_remains_visible_during_manual_disconnect() {
+        let mut state = state();
+        let TabState::Client {
+            connection_state, ..
+        } = &mut state;
+        *connection_state = ConnectionState::Disconnecting;
+        assert_eq!(
+            reduce_client_event(&mut state, ClientEvent::ControlOverflow, SystemTime::now()),
+            Some(ConnectionState::Failed)
+        );
+        assert!(error(&state).unwrap().message.contains("overflow"));
     }
 
     #[test]

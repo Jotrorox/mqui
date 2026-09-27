@@ -88,6 +88,9 @@ mod tests {
 
 #[derive(Debug)]
 pub enum ClientEvent {
+    /// The control queue overflowed. The client has stopped, and some control
+    /// events were lost. Delivered after already queued events, even when full.
+    ControlOverflow,
     State(ConnectionState),
     Status(String),
     Error(String),
@@ -130,4 +133,43 @@ pub enum ClientCommand {
         qos: u8,
         retain: bool,
     },
+}
+
+impl ClientEvent {
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::MessageReceived { topic, payload, .. } => {
+                    topic.capacity() + payload.capacity()
+                }
+                Self::Status(text) | Self::Error(text) | Self::Disconnected(text) => {
+                    text.capacity()
+                }
+                Self::Subscribed { topic, details, .. } | Self::Unsubscribed { topic, details } => {
+                    topic.capacity() + details.capacity()
+                }
+                Self::Published { topic, .. } => topic.capacity(),
+                _ => 0,
+            }
+    }
+}
+
+impl ClientCommand {
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + match self {
+                Self::Publish { topic, payload, .. } => topic.capacity() + payload.capacity(),
+                Self::Subscribe { topic, .. } | Self::Unsubscribe { topic } => topic.capacity(),
+                Self::Disconnect => 0,
+            }
+    }
+
+    pub(crate) fn packet_bytes(&self) -> usize {
+        // Conservative fixed header, packet ID, properties and string lengths.
+        16 + match self {
+            Self::Publish { topic, payload, .. } => topic.len().saturating_add(payload.len()),
+            Self::Subscribe { topic, .. } | Self::Unsubscribe { topic } => topic.len(),
+            Self::Disconnect => 0,
+        }
+    }
 }
